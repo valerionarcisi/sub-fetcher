@@ -1,0 +1,20 @@
+# State and config (contain tokens/credentials)
+state.json
+exclude_folders.txt
+
+# Logs
+*.log
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
