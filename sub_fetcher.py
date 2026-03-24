@@ -1550,6 +1550,7 @@ def process_callbacks(state, excludes):
 
             # Handle batch callbacks
             if action in ("batch_yes", "batch_no", "grp_exclude", "batch_translate", "batch_keep_en"):
+                state = load_state()
                 batch = state.get("batches", {}).get(path_hash)
                 if not batch:
                     tg_answer_callback(cb_id, "⚠️ Batch non trovato")
