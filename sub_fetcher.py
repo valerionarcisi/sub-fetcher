@@ -31,6 +31,7 @@ from xmlrpc.client import ServerProxy
 from pathlib import Path
 from datetime import datetime, timedelta
 from threading import Thread
+from queue import Queue, Empty
 
 # =============================================================================
 # CONFIGURATION
@@ -789,8 +790,10 @@ def pick_best(results, video_path):
 # SUBTITLE SYNC (ffsubsync)
 # =============================================================================
 
-def sync_subtitle(video_path, srt_path):
-    """Sync subtitle to video audio using ffsubsync. Overwrites srt_path in place."""
+def sync_subtitle(video_path, srt_path, min_score=0):
+    """Sync subtitle to video audio using ffsubsync. Overwrites srt_path in place.
+    Returns dict with 'ok', 'score', 'offset', 'fps_scale' or False on failure.
+    If min_score > 0, rejects syncs with score below threshold."""
     import subprocess, re as _re, tempfile, shutil
     try:
         tmp_out = tempfile.mktemp(suffix=".srt", prefix="ffsync_")
@@ -802,14 +805,20 @@ def sync_subtitle(video_path, srt_path):
             with open(tmp_log) as f:
                 log_content = f.read()
             os.remove(tmp_log)
+        score_match = _re.search(r"score:\s*([\d.-]+)", log_content)
         offset_match = _re.search(r"offset seconds:\s*([\d.-]+)", log_content)
         framerate_match = _re.search(r"framerate scale factor:\s*([\d.]+)", log_content)
+        score = float(score_match.group(1)) if score_match else 0.0
+        offset = offset_match.group(1) if offset_match else "?"
+        fps = framerate_match.group(1) if framerate_match else "1.000"
         if os.path.exists(tmp_out) and os.path.getsize(tmp_out) > 0:
+            if min_score > 0 and score < min_score:
+                log.warning(f"  ffsubsync score too low ({score:.1f} < {min_score}), rejecting sync")
+                os.remove(tmp_out)
+                return {"ok": False, "score": score, "offset": offset, "fps_scale": fps}
             shutil.move(tmp_out, srt_path)
-            offset = offset_match.group(1) if offset_match else "?"
-            fps = framerate_match.group(1) if framerate_match else "1.000"
-            log.info(f"  🔄 Synced: {os.path.basename(srt_path)} (offset: {offset}s, fps_scale: {fps})")
-            return True
+            log.info(f"  🔄 Synced: {os.path.basename(srt_path)} (score: {score:.0f}, offset: {offset}s, fps_scale: {fps})")
+            return {"ok": True, "score": score, "offset": offset, "fps_scale": fps}
         else:
             log.warning(f"  ffsubsync no output (exit {exit_code}): {log_content[:500]}")
             if os.path.exists(tmp_out):
@@ -1345,7 +1354,9 @@ def do_download(video_path, state, silent=False):
             with open(en_srt_path, "w", encoding="utf-8") as f:
                 f.write(eng_content)
         log.info(f"  Saved English sub: {os.path.basename(en_srt_path)}")
-        sync_subtitle(video_path, en_srt_path)
+        sync_result = sync_subtitle(video_path, en_srt_path, min_score=1000)
+        if isinstance(sync_result, dict) and not sync_result["ok"]:
+            log.warning(f"  EN sub sync score too low ({sync_result['score']:.0f}), sub may not match this video")
     except Exception as e:
         log.warning(f"  Failed to save/sync English sub: {e}")
 
@@ -1483,60 +1494,10 @@ def ask_user_grouped(missing, state):
         else:
             singles.append(paths[0])
 
-    if not singles:
-        return
-
-    # If there's only 1 single file, send individual message
-    if len(singles) == 1:
-        ask_user(singles[0], state)
-        return
-
-    # Multiple single files: group them into one digest message
-    batch_hash = str(abs(hash("digest" + str(len(singles)) + singles[0])))[:8]
-
-    file_list = "\n".join(
-        f"  • {friendly_name(p)}" for p in singles[:20]
-    )
-    if len(singles) > 20:
-        file_list += f"\n  ... e altri {len(singles) - 20}"
-
-    keyboard = {
-        "inline_keyboard": [
-            [
-                {"text": f"✅ Scarica tutti ({len(singles)})", "callback_data": f"batch_yes:{batch_hash}"},
-                {"text": "❌ Salta tutti", "callback_data": f"batch_no:{batch_hash}"},
-            ],
-        ]
-    }
-
-    result = tg_send(
-        f"🎬 <b>Sub ITA mancanti — {len(singles)} film</b>\n\n"
-        f"{file_list}\n\n"
-        f"Scarico i sottotitoli italiani?",
-        reply_markup=keyboard,
-    )
-
-    msg_id = None
-    if result and result.get("ok"):
-        msg_id = result["result"]["message_id"]
-
-    state.setdefault("batches", {})[batch_hash] = {
-        "paths": singles,
-        "folder": "film_digest",
-        "time": datetime.now().isoformat(),
-        "msg_id": msg_id,
-    }
-
+    # Send individual messages for each single film
     for p in singles:
-        path_hash = str(abs(hash(p)))[:8]
-        state["asked"][p] = {
-            "time": datetime.now().isoformat(),
-            "status": "pending",
-            "path_hash": path_hash,
-            "batch": batch_hash,
-        }
-
-    save_state(state)
+        ask_user(p, state)
+        time.sleep(0.5)
 
 
 def find_path_by_hash(state, path_hash):
@@ -1577,13 +1538,15 @@ def process_callbacks(state, excludes):
                     continue
 
                 if action == "batch_yes":
-                    tg_answer_callback(cb_id, "⬇️ Scarico...")
+                    pos = queue_position()
+                    tg_answer_callback(cb_id, f"⬇️ In coda{f' (pos. {pos+1})' if pos > 0 else ''}...")
                     if msg_id:
                         tg_edit_message(msg_id,
                             f"⬇️ <b>Scaricando sottotitoli...</b>\n\n"
                             f"[░░░░░░░░░░] 0%\n"
-                            f"📊 0/{len(batch['paths'])}")
-                    do_batch_download(batch["paths"], state, progress_msg_id=msg_id)
+                            f"📊 0/{len(batch['paths'])}"
+                            + (f"\n⏳ In coda (posizione {pos+1})" if pos > 0 else ""))
+                    download_queue.put({"type": "batch", "paths": batch["paths"], "msg_id": msg_id})
                 elif action == "grp_exclude":
                     folder = batch.get("folder", "")
                     if folder:
@@ -1617,12 +1580,12 @@ def process_callbacks(state, excludes):
             name = friendly_name(video_path)
 
             if action == "yes":
-                tg_answer_callback(cb_id, "⬇️ Scarico...")
+                pos = queue_position()
+                tg_answer_callback(cb_id, f"⬇️ In coda{f' (pos. {pos+1})' if pos > 0 else ''}...")
                 if msg_id:
-                    tg_edit_message(msg_id, f"⬇️ Scaricando sub ITA per:\n<b>{name}</b>...")
-                success = do_download(video_path, state)
-                if not success and msg_id:
-                    tg_edit_message(msg_id, f"❌ Non trovato sub ITA per:\n<b>{name}</b>\nRiproverò tra 24h.")
+                    tg_edit_message(msg_id, f"⬇️ Scaricando sub ITA per:\n<b>{name}</b>..."
+                                   + (f"\n⏳ In coda (posizione {pos+1})" if pos > 0 else ""))
+                download_queue.put({"type": "single", "path": video_path, "msg_id": msg_id})
 
             elif action == "no":
                 tg_answer_callback(cb_id, "⏭ Saltato")
@@ -1951,7 +1914,8 @@ def do_sync(query, state):
                 f"🔄 Sync <b>{query}</b>...\n\n"
                 f"{bar}\n"
                 f"📊 {i}/{len(pairs)} — ✅ {synced} | ❌ {failed}")
-        if sync_subtitle(video_path, srt_path):
+        result = sync_subtitle(video_path, srt_path)
+        if result and (result is True or (isinstance(result, dict) and result["ok"])):
             synced += 1
         else:
             failed += 1
@@ -2025,6 +1989,49 @@ def _progress_bar(current, total, width=10):
 # MAIN LOOP
 # =============================================================================
 
+# =============================================================================
+# DOWNLOAD QUEUE
+# =============================================================================
+
+download_queue = Queue()
+
+
+def _queue_worker(state_ref):
+    """Background worker that processes download requests sequentially."""
+    while True:
+        try:
+            job = download_queue.get(timeout=5)
+        except Empty:
+            continue
+        try:
+            job_type = job.get("type", "single")
+            state = load_state()
+            if job_type == "batch":
+                paths = job["paths"]
+                msg_id = job.get("msg_id")
+                log.info(f"  Queue: processing batch of {len(paths)} files")
+                do_batch_download(paths, state, progress_msg_id=msg_id)
+            else:
+                video_path = job["path"]
+                msg_id = job.get("msg_id")
+                name = friendly_name(video_path)
+                log.info(f"  Queue: processing {os.path.basename(video_path)}")
+                success = do_download(video_path, state)
+                if success and msg_id:
+                    tg_edit_message(msg_id, f"✅ Sub ITA scaricato per:\n<b>{name}</b>")
+                elif not success and msg_id:
+                    tg_edit_message(msg_id, f"❌ Non trovato sub ITA per:\n<b>{name}</b>\nRiproverò tra 24h.")
+        except Exception as e:
+            log.error(f"  Queue worker error: {e}", exc_info=True)
+        finally:
+            download_queue.task_done()
+
+
+def queue_position():
+    """Return current queue size."""
+    return download_queue.qsize()
+
+
 def main():
     log.info("=== Sub ITA Fetcher starting ===")
     log.info(f"Series path: {SERIES_PATH}")
@@ -2033,6 +2040,10 @@ def main():
 
     state = load_state()
     excludes = load_excludes()
+
+    # Start background download worker
+    worker = Thread(target=_queue_worker, args=(state,), daemon=True)
+    worker.start()
 
     # Send startup message
     tg_send("🚀 <b>Sub ITA Fetcher avviato!</b>\nDigita /help per i comandi.")

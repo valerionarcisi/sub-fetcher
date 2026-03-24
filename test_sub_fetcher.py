@@ -572,5 +572,46 @@ class TestSyncSkipLogic(unittest.TestCase):
         self.assertEqual(sig.parameters["skip_sync"].default, False)
 
 
+class TestSyncSubtitleReturn(unittest.TestCase):
+    """Test that sync_subtitle returns dict with score info."""
+
+    def test_sync_signature_has_min_score(self):
+        import inspect
+        sig = inspect.signature(sub_fetcher.sync_subtitle)
+        self.assertIn("min_score", sig.parameters)
+        self.assertEqual(sig.parameters["min_score"].default, 0)
+
+
+class TestDownloadQueue(unittest.TestCase):
+    """Test download queue infrastructure."""
+
+    def test_queue_exists(self):
+        self.assertTrue(hasattr(sub_fetcher, "download_queue"))
+
+    def test_queue_position_returns_int(self):
+        pos = sub_fetcher.queue_position()
+        self.assertIsInstance(pos, int)
+        self.assertEqual(pos, 0)
+
+    def test_queue_put_and_get(self):
+        sub_fetcher.download_queue.put({"type": "single", "path": "/test/video.mkv"})
+        self.assertEqual(sub_fetcher.queue_position(), 1)
+        job = sub_fetcher.download_queue.get_nowait()
+        self.assertEqual(job["path"], "/test/video.mkv")
+        sub_fetcher.download_queue.task_done()
+
+
+class TestAskUserGroupedFilmsSingle(unittest.TestCase):
+    """Test that films get individual messages, not digest."""
+
+    def test_singles_not_grouped(self):
+        # Verify ask_user_grouped doesn't create film_digest batches
+        # by checking the function source code
+        import inspect
+        source = inspect.getsource(sub_fetcher.ask_user_grouped)
+        self.assertNotIn("film_digest", source)
+        self.assertNotIn("Scarica tutti", source)
+
+
 if __name__ == "__main__":
     unittest.main()

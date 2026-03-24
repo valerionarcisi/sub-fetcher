@@ -82,8 +82,9 @@ Uses `ffprobe` to inspect audio stream metadata. Checks `language` tag for "ita"
 Uses `ffsubsync` to align subtitle timecodes to the video's audio track via Voice Activity Detection. Analyzes when speech occurs in the audio and aligns subtitle timecodes accordingly. Calculates both time offset (seconds) and framerate scale factor for different video releases. Uses `os.system()` shell execution (not `subprocess.run` with pipes, which interferes with ffsubsync's `rich` library). Non-blocking: if sync fails, the unsynchronized subtitle is kept. Timeout: 5 minutes.
 
 **Sync strategy:**
-- **Downloaded subs (Subdl/OS)**: Sync `.en.srt` to audio FIRST, then translate to `.it.srt` preserving synced timecodes.
+- **Downloaded subs (Subdl/OS)**: Sync `.en.srt` to audio FIRST (with `min_score=1000` validation), then translate to `.it.srt` preserving synced timecodes.
 - **Local `.en.srt` already present**: Skip sync (timecodes already match the video), translate directly.
+- **Score validation**: ffsubsync returns a confidence score. Syncs with score < min_score are logged as warnings (sub may not match the video).
 - The `/sync` command re-syncs existing `.it.srt` files on demand.
 
 ### Dual Subtitle Save
@@ -114,10 +115,9 @@ Each translation tracks `input_tokens`, `output_tokens`, and cost (USD) in `stat
 
 ## Telegram UX
 
-### Grouped Notifications
-- **Series with multiple episodes**: 1 message per series with episode list
-- **Multiple single films**: 1 digest message listing all films
-- **Single file**: 1 individual message
+### Notifications
+- **Series with multiple episodes**: 1 grouped message per series with episode list + "Scarica tutti" button
+- **Films**: 1 individual message per film with Scarica/No/Escludi buttons
 
 ### Batch Progress
 Single message updated in-place with progress bar:
@@ -127,6 +127,9 @@ Single message updated in-place with progress bar:
 📊 4/10 — ✅ 3 | ❌ 1
 ```
 Final summary with success/failure lists replaces progress message.
+
+### Download Queue
+All download requests (single films, batch series) go through a thread-safe FIFO queue processed by a background worker. This prevents concurrent downloads from interfering and allows multiple "Scarica" clicks without blocking the Telegram callback handler. Queue position is shown when multiple downloads are pending.
 
 ### Silent Mode
 During batch downloads, per-file Telegram messages are suppressed. Only the final batch summary is shown.
@@ -179,7 +182,7 @@ During batch downloads, per-file Telegram messages are suppressed. Only the fina
 ## Testing
 Run: `python3 test_sub_fetcher.py -v`
 
-Test coverage (43 tests):
+Test coverage (48 tests):
 - `find_imdb_id`: NFO parsing
 - `detect_language_from_srt`: Italian/English/unknown detection
 - `find_existing_srt`: English, generic, missing, Italian-tagged SRT
@@ -193,3 +196,6 @@ Test coverage (43 tests):
 - `SubdlForcedFiltering`: Scoring penalty, block count rejection
 - `SubdlZipPreferNonForced`: ZIP non-forced preference, forced fallback
 - `SyncSkipLogic`: skip_sync parameter acceptance
+- `SyncSubtitleReturn`: min_score parameter
+- `DownloadQueue`: queue existence, position, put/get
+- `AskUserGroupedFilmsSingle`: films get individual messages
