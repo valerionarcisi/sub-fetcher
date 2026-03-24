@@ -184,13 +184,16 @@ def tg_answer_callback(callback_id, text=""):
     })
 
 
-def tg_edit_message(message_id, text):
-    return tg_request("editMessageText", {
+def tg_edit_message(message_id, text, reply_markup=None):
+    payload = {
         "chat_id": TELEGRAM_CHAT_ID,
         "message_id": message_id,
         "text": text,
         "parse_mode": "HTML",
-    })
+    }
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
+    return tg_request("editMessageText", payload)
 
 
 def tg_get_updates(offset=0):
@@ -698,6 +701,10 @@ class SubdlClient:
     def _try_download(self, results, video_path, max_tries=3):
         """Try downloading from results, picking best match first."""
         video_base = os.path.splitext(os.path.basename(video_path))[0].lower()
+        parsed = parse_video(video_path)
+        video_season = parsed.get("season")
+        video_episode = parsed.get("episode")
+
         # Extract release group (last part after dash, e.g. "FENiX" from "...x264-FENiX")
         release_group = ""
         m = re.search(r"-([a-zA-Z0-9]+)$", os.path.splitext(os.path.basename(video_path))[0])
@@ -714,6 +721,17 @@ class SubdlClient:
             release = (sub.get("release_name", "") or "").lower()
             sub_name = (sub.get("name", "") or "").lower()
             sub_tokens = set(re.findall(r"[a-zA-Z0-9]+", release))
+
+            # CRITICAL: episode match — reject subs for wrong episode
+            if video_season is not None and video_episode is not None:
+                ep_match = re.search(r"s(\d+)e(\d+)", release)
+                if ep_match:
+                    sub_season = int(ep_match.group(1))
+                    sub_episode = int(ep_match.group(2))
+                    if sub_season == video_season and sub_episode == video_episode:
+                        score += 500
+                    else:
+                        score -= 1000
 
             # Penalize forced/signs-only subs heavily
             if any(tag in release or tag in sub_name for tag in ["forced", "signs", "songs", "sdh", "hi-only"]):
@@ -1235,9 +1253,10 @@ def _translate_and_save(eng_content, video_path, state, silent=False, skip_sync=
     return True
 
 
-def do_download(video_path, state, silent=False):
-    """Search and download subtitle for a video file. Returns True on success.
-    When silent=True, suppresses per-file Telegram messages (used in batch mode)."""
+def do_download(video_path, state, silent=False, translate=True):
+    """Search and download subtitle for a video file.
+    Returns: True (ITA found), "en_only" (EN saved, needs translation), False (nothing found).
+    When translate=False, downloads EN sub but does NOT translate (saves money, user decides later)."""
     fname = os.path.basename(video_path)
     log.info(f"Downloading sub for: {fname}")
 
@@ -1256,12 +1275,18 @@ def do_download(video_path, state, silent=False):
             if not silent:
                 tg_send(f"✅ Sub ITA trovato nella cartella:\n<b>{friendly_name(video_path)}</b>")
             return True
-        elif existing["lang"] == "en" and CLAUDE_API_KEY:
-            log.info(f"  Found existing English sub: {existing['path']}, translating...")
-            if not silent:
-                tg_send(f"📖 Sub ENG trovato nella cartella, traduco in ITA...\n<b>{friendly_name(video_path)}</b>")
-            if _translate_and_save(existing["path"], video_path, state, silent=silent, skip_sync=True):
-                return True
+        elif existing["lang"] == "en":
+            en_srt_path = os.path.splitext(video_path)[0] + ".en.srt"
+            if existing["path"] != en_srt_path:
+                import shutil
+                shutil.copy2(existing["path"], en_srt_path)
+            log.info(f"  Found existing English sub: {existing['path']}")
+            if translate and CLAUDE_API_KEY:
+                log.info(f"  Translating existing EN sub...")
+                if _translate_and_save(en_srt_path, video_path, state, silent=silent, skip_sync=True):
+                    return True
+            else:
+                return "en_only"
 
     # =================================================================
     # STEP 1: Subdl.com — search ITA (primary, no VIP placeholders)
@@ -1308,24 +1333,12 @@ def do_download(video_path, state, silent=False):
     log.warning(f"  No Italian subs found for: {fname}")
 
     # =================================================================
-    # STEP 3: ENG fallback — Subdl → OS → translate with Claude
+    # STEP 3: ENG fallback — download and sync EN sub
     # =================================================================
-    if not CLAUDE_API_KEY:
-        log.info("  No CLAUDE_API_KEY set, skipping EN->IT translation fallback")
-        if os_logged_in:
-            client.logout()
-        state["asked"][video_path] = {"time": datetime.now().isoformat(), "status": "failed"}
-        save_state(state)
-        if not silent:
-            tg_send(f"❌ Nessun sub ITA trovato per:\n<b>{friendly_name(video_path)}</b>\n(CLAUDE_API_KEY non configurata)")
-        return False
+    log.info(f"  Trying English fallback...")
 
-    log.info(f"  Trying English fallback + Claude translation...")
-
-    # Try Subdl ENG first
     eng_content = subdl.search_and_download(video_path, language="en")
 
-    # Fallback: OpenSubtitles ENG
     if not eng_content and os_logged_in:
         file_hash, file_size = compute_hash(video_path)
         eng_content = search_and_download_english(client, video_path, file_hash, file_size)
@@ -1343,8 +1356,6 @@ def do_download(video_path, state, silent=False):
     if os_logged_in:
         client.logout()
 
-    # Sync the downloaded English sub to video audio BEFORE translating
-    # so both .en.srt and .it.srt end up with correct timecodes
     en_srt_path = os.path.splitext(video_path)[0] + ".en.srt"
     try:
         if isinstance(eng_content, bytes):
@@ -1360,7 +1371,14 @@ def do_download(video_path, state, silent=False):
     except Exception as e:
         log.warning(f"  Failed to save/sync English sub: {e}")
 
-    # Translate from the synced .en.srt (skip_sync=True: timecodes already correct)
+    if not translate:
+        log.info(f"  ✅ EN sub saved (translation deferred, user will decide)")
+        return "en_only"
+
+    if not CLAUDE_API_KEY:
+        log.info("  No CLAUDE_API_KEY set, skipping EN->IT translation")
+        return "en_only"
+
     if _translate_and_save(en_srt_path, video_path, state, silent=silent, skip_sync=True):
         return True
 
@@ -1531,13 +1549,35 @@ def process_callbacks(state, excludes):
             video_path = find_path_by_hash(state, path_hash)
 
             # Handle batch callbacks
-            if action in ("batch_yes", "batch_no", "grp_exclude"):
+            if action in ("batch_yes", "batch_no", "grp_exclude", "batch_translate", "batch_keep_en"):
                 batch = state.get("batches", {}).get(path_hash)
                 if not batch:
                     tg_answer_callback(cb_id, "⚠️ Batch non trovato")
                     continue
 
-                if action == "batch_yes":
+                if action == "batch_translate":
+                    tg_answer_callback(cb_id, "🤖 Traduzione avviata...")
+                    if msg_id:
+                        tg_edit_message(msg_id,
+                            f"🤖 <b>Traducendo EN→IT...</b>\n\n"
+                            f"[░░░░░░░░░░] 0%\n"
+                            f"📊 0/{len(batch['paths'])}")
+                    download_queue.put({"type": "translate", "paths": batch["paths"], "msg_id": msg_id})
+                    state.get("batches", {}).pop(path_hash, None)
+                    save_state(state)
+                    continue
+
+                elif action == "batch_keep_en":
+                    tg_answer_callback(cb_id, "🇬🇧 Mantenuti solo ENG")
+                    for p in batch.get("paths", []):
+                        state["asked"][p] = {"time": datetime.now().isoformat(), "status": "en_only"}
+                    if msg_id:
+                        tg_edit_message(msg_id, f"🇬🇧 Sub inglesi mantenuti senza traduzione.\nPuoi tradurre in seguito con /translate")
+                    state.get("batches", {}).pop(path_hash, None)
+                    save_state(state)
+                    continue
+
+                elif action == "batch_yes":
                     pos = queue_position()
                     tg_answer_callback(cb_id, f"⬇️ In coda{f' (pos. {pos+1})' if pos > 0 else ''}...")
                     if msg_id:
@@ -1761,7 +1801,13 @@ def find_videos_by_name(query):
                 folder_name = get_series_folder(full_path).lower()
                 fname_lower = fname.lower()
 
-                if query_lower in folder_name or query_lower in fname_lower:
+                # Also match with dots/underscores replaced by spaces
+                fname_clean = re.sub(r"[._\-]", " ", fname_lower)
+                folder_clean = re.sub(r"[._\-]", " ", folder_name)
+                query_clean = re.sub(r"[._\-]", " ", query_lower)
+
+                if (query_lower in folder_name or query_lower in fname_lower
+                    or query_clean in folder_clean or query_clean in fname_clean):
                     matches.append(full_path)
 
     return matches
@@ -1932,7 +1978,104 @@ def do_sync(query, state):
 
 
 def do_batch_download(paths, state, progress_msg_id=None):
-    """Download subs for a batch of files with progress on a single Telegram message."""
+    """Download subs for a batch of files with progress on a single Telegram message.
+    Step 1: Download EN subs (free). Step 2: Ask user to confirm translation (paid)."""
+    total = len(paths)
+    ita_found = 0
+    en_found = 0
+    not_found = 0
+    ita_names = []
+    en_paths = []
+    en_names = []
+    failed_names = []
+
+    for i, video_path in enumerate(paths):
+        if has_italian_sub(video_path):
+            ita_found += 1
+            ita_names.append(friendly_name(video_path))
+            continue
+
+        if progress_msg_id and (i % 3 == 0 or i == total - 1):
+            bar = _progress_bar(i, total)
+            tg_edit_message(progress_msg_id,
+                f"⬇️ <b>Scaricando sottotitoli...</b>\n\n"
+                f"{bar}\n"
+                f"📊 {i}/{total} — 🇮🇹 {ita_found} | 🇬🇧 {en_found} | ❌ {not_found}")
+
+        result = do_download(video_path, state, silent=True, translate=False)
+        if result is True:
+            ita_found += 1
+            ita_names.append(friendly_name(video_path))
+        elif result == "en_only":
+            en_found += 1
+            en_paths.append(video_path)
+            en_names.append(friendly_name(video_path))
+        else:
+            not_found += 1
+            failed_names.append(friendly_name(video_path))
+        time.sleep(1)
+
+    # Build summary
+    summary = f"📊 <b>Download completato</b>\n\n"
+    summary += f"🇮🇹 Sub ITA trovati: {ita_found}/{total}\n"
+    summary += f"🇬🇧 Solo ENG (da tradurre): {en_found}/{total}\n"
+    summary += f"❌ Non trovati: {not_found}/{total}"
+
+    if ita_names and len(ita_names) <= 10:
+        summary += "\n\n<b>Sub ITA:</b>\n" + "\n".join(f"  🇮🇹 {n}" for n in ita_names)
+    if en_names and len(en_names) <= 15:
+        summary += "\n\n<b>Solo ENG (servono traduzione):</b>\n" + "\n".join(f"  🇬🇧 {n}" for n in en_names)
+    if failed_names and len(failed_names) <= 10:
+        summary += "\n\n<b>Non trovati:</b>\n" + "\n".join(f"  ❌ {n}" for n in failed_names)
+
+    if en_paths:
+        total_cost, total_blocks = _estimate_batch_translation_cost(en_paths)
+        summary += f"\n\n💰 <b>Costo traduzione stimato: ${total_cost:.2f}</b> ({total_blocks} blocchi)"
+
+        translate_hash = str(abs(hash(tuple(en_paths))))[:8]
+        state.setdefault("batches", {})[translate_hash] = {
+            "paths": en_paths,
+            "type": "translate",
+        }
+        save_state(state)
+
+        keyboard = {"inline_keyboard": [
+            [
+                {"text": f"🤖 Traduci in italiano (${total_cost:.2f})", "callback_data": f"batch_translate:{translate_hash}"},
+                {"text": "🇬🇧 Tieni solo ENG", "callback_data": f"batch_keep_en:{translate_hash}"},
+            ]
+        ]}
+        if progress_msg_id:
+            tg_edit_message(progress_msg_id, summary, reply_markup=keyboard)
+        else:
+            tg_send(summary, reply_markup=keyboard)
+    else:
+        if progress_msg_id:
+            tg_edit_message(progress_msg_id, summary)
+        else:
+            tg_send(summary)
+
+
+def _estimate_batch_translation_cost(paths):
+    """Estimate total translation cost for a list of video paths with .en.srt files."""
+    total_cost = 0.0
+    total_blocks = 0
+    for video_path in paths:
+        en_srt = os.path.splitext(video_path)[0] + ".en.srt"
+        if os.path.exists(en_srt):
+            try:
+                with open(en_srt, "r", encoding="utf-8", errors="ignore") as f:
+                    content = f.read()
+                cost, blocks = estimate_translation_cost(content)
+                total_cost += cost
+                total_blocks += blocks
+            except Exception:
+                pass
+    return total_cost, total_blocks
+
+
+def do_batch_translate(paths, state, progress_msg_id=None):
+    """Translate a batch of EN subs to IT. Called after user confirms translation."""
     total = len(paths)
     success = 0
     failed = 0
@@ -1945,16 +2088,20 @@ def do_batch_download(paths, state, progress_msg_id=None):
             success_names.append(friendly_name(video_path))
             continue
 
-        # Update progress on existing message
-        if progress_msg_id and (i % 3 == 0 or i == total - 1):
+        en_srt = os.path.splitext(video_path)[0] + ".en.srt"
+        if not os.path.exists(en_srt):
+            failed += 1
+            failed_names.append(friendly_name(video_path))
+            continue
+
+        if progress_msg_id and (i % 2 == 0 or i == total - 1):
             bar = _progress_bar(i, total)
             tg_edit_message(progress_msg_id,
-                f"⬇️ <b>Scaricando sottotitoli...</b>\n\n"
+                f"🤖 <b>Traducendo EN→IT...</b>\n\n"
                 f"{bar}\n"
                 f"📊 {i}/{total} — ✅ {success} | ❌ {failed}")
 
-        result = do_download(video_path, state, silent=True)
-        if result:
+        if _translate_and_save(en_srt, video_path, state, silent=True, skip_sync=True):
             success += 1
             success_names.append(friendly_name(video_path))
         else:
@@ -1962,12 +2109,18 @@ def do_batch_download(paths, state, progress_msg_id=None):
             failed_names.append(friendly_name(video_path))
         time.sleep(1)
 
-    # Final summary
-    summary = f"📊 <b>Batch completato</b>\n\n✅ Scaricati: {success}/{total}\n❌ Non trovati: {failed}/{total}"
+    actual_state = load_state()
+    costs = actual_state.get("claude_costs", {})
+    total_spent = costs.get("total_cost_usd", 0.0)
+
+    summary = f"🤖 <b>Traduzione completata</b>\n\n"
+    summary += f"✅ Tradotti: {success}/{total}\n❌ Falliti: {failed}/{total}\n"
+    summary += f"💰 Costo totale sessione: ${total_spent:.4f}"
+
     if success_names and len(success_names) <= 10:
-        summary += "\n\n<b>Scaricati:</b>\n" + "\n".join(f"  ✅ {n}" for n in success_names)
+        summary += "\n\n<b>Tradotti:</b>\n" + "\n".join(f"  ✅ {n}" for n in success_names)
     if failed_names and len(failed_names) <= 10:
-        summary += "\n\n<b>Non trovati:</b>\n" + "\n".join(f"  ❌ {n}" for n in failed_names)
+        summary += "\n\n<b>Falliti:</b>\n" + "\n".join(f"  ❌ {n}" for n in failed_names)
 
     if progress_msg_id:
         tg_edit_message(progress_msg_id, summary)
@@ -2011,16 +2164,40 @@ def _queue_worker(state_ref):
                 msg_id = job.get("msg_id")
                 log.info(f"  Queue: processing batch of {len(paths)} files")
                 do_batch_download(paths, state, progress_msg_id=msg_id)
+            elif job_type == "translate":
+                paths = job["paths"]
+                msg_id = job.get("msg_id")
+                log.info(f"  Queue: translating batch of {len(paths)} files")
+                do_batch_translate(paths, state, progress_msg_id=msg_id)
             else:
                 video_path = job["path"]
                 msg_id = job.get("msg_id")
                 name = friendly_name(video_path)
                 log.info(f"  Queue: processing {os.path.basename(video_path)}")
-                success = do_download(video_path, state)
-                if success and msg_id:
+                result = do_download(video_path, state, translate=False)
+                if result is True and msg_id:
                     tg_edit_message(msg_id, f"✅ Sub ITA scaricato per:\n<b>{name}</b>")
-                elif not success and msg_id:
-                    tg_edit_message(msg_id, f"❌ Non trovato sub ITA per:\n<b>{name}</b>\nRiproverò tra 24h.")
+                elif result == "en_only" and msg_id:
+                    en_srt = os.path.splitext(video_path)[0] + ".en.srt"
+                    cost, blocks = (0, 0)
+                    if os.path.exists(en_srt):
+                        with open(en_srt, "r", encoding="utf-8", errors="ignore") as f:
+                            cost, blocks = estimate_translation_cost(f.read())
+                    tr_hash = str(abs(hash(video_path)))[:8]
+                    state.setdefault("batches", {})[tr_hash] = {"paths": [video_path], "type": "translate"}
+                    save_state(state)
+                    keyboard = {"inline_keyboard": [
+                        [
+                            {"text": f"🤖 Traduci (${cost:.2f})", "callback_data": f"batch_translate:{tr_hash}"},
+                            {"text": "🇬🇧 Tieni ENG", "callback_data": f"batch_keep_en:{tr_hash}"},
+                        ]
+                    ]}
+                    tg_edit_message(msg_id,
+                        f"🇬🇧 Sub ENG trovato per:\n<b>{name}</b>\n\n"
+                        f"💰 Tradurre in italiano? Costo: <b>${cost:.2f}</b> ({blocks} blocchi)",
+                        reply_markup=keyboard)
+                elif not result and msg_id:
+                    tg_edit_message(msg_id, f"❌ Non trovato sub per:\n<b>{name}</b>\nRiproverò tra 24h.")
         except Exception as e:
             log.error(f"  Queue worker error: {e}", exc_info=True)
         finally:

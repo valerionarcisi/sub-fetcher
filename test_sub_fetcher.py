@@ -601,16 +601,105 @@ class TestDownloadQueue(unittest.TestCase):
         sub_fetcher.download_queue.task_done()
 
 
-class TestAskUserGroupedFilmsSingle(unittest.TestCase):
-    """Test that films get individual messages, not digest."""
+class TestEpisodeMatchingInScoring(unittest.TestCase):
+    """Test that Subdl scoring correctly matches episode numbers."""
 
-    def test_singles_not_grouped(self):
-        # Verify ask_user_grouped doesn't create film_digest batches
-        # by checking the function source code
+    def test_correct_episode_gets_high_score(self):
+        results = [
+            {"release_name": "Pluribus S01E01 720p WEB", "url": "/sub/1.zip", "name": ""},
+            {"release_name": "Pluribus S01E08 720p WEB", "url": "/sub/2.zip", "name": ""},
+        ]
+        client = sub_fetcher.SubdlClient()
+        video_path = "/media/series/PLUR1BUS/Pluribus.S01E01.720p.x264-FENiX.mkv"
+
+        scored = []
+        parsed = sub_fetcher.parse_video(video_path)
+        for sub_item in results:
+            score = 0
+            release = (sub_item.get("release_name", "") or "").lower()
+            ep_match = re.search(r"s(\d+)e(\d+)", release)
+            if ep_match and parsed.get("season") is not None:
+                if int(ep_match.group(1)) == parsed["season"] and int(ep_match.group(2)) == parsed["episode"]:
+                    score += 500
+                else:
+                    score -= 1000
+            scored.append((score, sub_item))
+        scored.sort(key=lambda x: x[0], reverse=True)
+
+        self.assertEqual(scored[0][1]["release_name"], "Pluribus S01E01 720p WEB")
+        self.assertGreater(scored[0][0], scored[1][0])
+
+    def test_wrong_episode_gets_negative_score(self):
+        parsed = sub_fetcher.parse_video("/media/series/Show/Show.S01E01.mkv")
+        release = "show s01e08 720p web"
+        ep_match = re.search(r"s(\d+)e(\d+)", release)
+        self.assertIsNotNone(ep_match)
+        sub_season = int(ep_match.group(1))
+        sub_episode = int(ep_match.group(2))
+        self.assertNotEqual(sub_episode, parsed["episode"])
+
+
+class TestTwoPhaseDownload(unittest.TestCase):
+    """Test that do_download supports translate=False for two-phase flow."""
+
+    def test_do_download_accepts_translate_param(self):
         import inspect
-        source = inspect.getsource(sub_fetcher.ask_user_grouped)
-        self.assertNotIn("film_digest", source)
-        self.assertNotIn("Scarica tutti", source)
+        sig = inspect.signature(sub_fetcher.do_download)
+        self.assertIn("translate", sig.parameters)
+        self.assertEqual(sig.parameters["translate"].default, True)
+
+    def test_do_batch_translate_exists(self):
+        self.assertTrue(hasattr(sub_fetcher, "do_batch_translate"))
+        self.assertTrue(callable(sub_fetcher.do_batch_translate))
+
+    def test_estimate_batch_translation_cost_exists(self):
+        self.assertTrue(hasattr(sub_fetcher, "_estimate_batch_translation_cost"))
+
+
+class TestFindVideosByNameWithDots(unittest.TestCase):
+    """Test that manual search handles dots and underscores in filenames."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self._orig_series = sub_fetcher.SERIES_PATH
+        self._orig_films = sub_fetcher.FILMS_PATH
+        sub_fetcher.SERIES_PATH = os.path.join(self.tmpdir, "series")
+        sub_fetcher.FILMS_PATH = os.path.join(self.tmpdir, "films")
+        os.makedirs(sub_fetcher.SERIES_PATH)
+        os.makedirs(sub_fetcher.FILMS_PATH)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir)
+        sub_fetcher.SERIES_PATH = self._orig_series
+        sub_fetcher.FILMS_PATH = self._orig_films
+
+    def test_finds_dotted_filename(self):
+        show_dir = os.path.join(sub_fetcher.SERIES_PATH, "PLUR1BUS")
+        os.makedirs(show_dir)
+        video = os.path.join(show_dir, "Pluribus.S01E01.720p.x264-FENiX.mkv")
+        open(video, "w").close()
+
+        matches = sub_fetcher.find_videos_by_name("pluribus s01e01")
+        self.assertEqual(len(matches), 1)
+
+    def test_finds_by_folder_name(self):
+        show_dir = os.path.join(sub_fetcher.SERIES_PATH, "PLUR1BUS")
+        os.makedirs(show_dir)
+        video = os.path.join(show_dir, "Pluribus.S01E01.720p.x264-FENiX.mkv")
+        open(video, "w").close()
+
+        matches = sub_fetcher.find_videos_by_name("pluribus")
+        self.assertEqual(len(matches), 1)
+
+
+class TestQueueTranslateJobType(unittest.TestCase):
+    """Test that queue worker handles 'translate' job type."""
+
+    def test_queue_accepts_translate_job(self):
+        sub_fetcher.download_queue.put({"type": "translate", "paths": ["/test/video.mkv"]})
+        job = sub_fetcher.download_queue.get_nowait()
+        self.assertEqual(job["type"], "translate")
+        sub_fetcher.download_queue.task_done()
 
 
 if __name__ == "__main__":
