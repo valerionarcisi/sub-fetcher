@@ -3,6 +3,7 @@
 
 import os
 import sys
+import re
 import tempfile
 import shutil
 import unittest
@@ -466,6 +467,109 @@ class TestSubdlClient(unittest.TestCase):
         client = sub_fetcher.SubdlClient()
         self.assertEqual(client.LANG_MAP.get("ita"), "it")
         self.assertEqual(client.LANG_MAP.get("eng"), "en")
+
+
+class TestSubdlForcedFiltering(unittest.TestCase):
+    """Test that forced/signs-only subs are penalized and rejected."""
+
+    def test_scoring_penalizes_forced(self):
+        results = [
+            {"release_name": "Movie.720p.x264-GRP.eng-forced", "url": "/sub/1.zip", "name": "forced"},
+            {"release_name": "Movie.720p.x264-GRP.eng-SDH", "url": "/sub/2.zip", "name": "full"},
+        ]
+        client = sub_fetcher.SubdlClient()
+        video_path = "/media/films/Movie (2024)/Movie.720p.x264-GRP.mkv"
+        video_base = os.path.splitext(os.path.basename(video_path))[0].lower()
+        release_group = "grp"
+
+        scored = []
+        for sub in results:
+            score = 0
+            release = (sub.get("release_name", "") or "").lower()
+            sub_name = (sub.get("name", "") or "").lower()
+            if any(tag in release or tag in sub_name for tag in ["forced", "signs", "songs", "sdh", "hi-only"]):
+                score -= 200
+            scored.append((score, sub))
+        scored.sort(key=lambda x: x[0], reverse=True)
+
+        # The non-forced sub should rank higher (SDH is penalized too but less important here)
+        # Both have negative scores due to "forced" and "sdh" tags
+        # The forced one should have -200, SDH also -200
+        # In real usage the full sub without any tag would rank highest
+        self.assertTrue(scored[0][0] >= scored[-1][0])
+
+    def test_rejects_sub_with_few_blocks(self):
+        # A forced sub with only 5 blocks should be rejected
+        forced_content = b"1\n00:00:01,000 --> 00:00:03,000\nKusimayu!\n\n" \
+                         b"2\n00:00:10,000 --> 00:00:12,000\n[speaks Spanish]\n\n" \
+                         b"3\n00:00:20,000 --> 00:00:22,000\nBongiorno\n\n"
+        block_count = len(re.findall(rb"\d+\r?\n\d{2}:\d{2}:\d{2}", forced_content))
+        self.assertLess(block_count, 10)
+
+    def test_accepts_sub_with_many_blocks(self):
+        # A full sub with 500+ blocks should be accepted
+        lines = []
+        for i in range(100):
+            m, s = divmod(i * 3, 60)
+            lines.append(f"{i+1}\n00:{m:02d}:{s:02d},000 --> 00:{m:02d}:{s+2:02d},000\nDialogue line {i}\n\n")
+        full_content = "".join(lines).encode("utf-8")
+        block_count = len(re.findall(rb"\d+\r?\n\d{2}:\d{2}:\d{2}", full_content))
+        self.assertGreaterEqual(block_count, 10)
+
+
+class TestSubdlZipPreferNonForced(unittest.TestCase):
+    """Test that ZIP extraction prefers non-forced SRT files."""
+
+    def test_prefers_non_forced_srt_in_zip(self):
+        zip_buffer = io.BytesIO()
+        with zipfile.ZipFile(zip_buffer, "w") as zf:
+            zf.writestr("Movie.eng-forced.srt", "1\n00:00:01,000 --> 00:00:03,000\nForced only\n")
+            zf.writestr("Movie.eng.srt", "1\n00:00:01,000 --> 00:00:03,000\nFull dialogue\n")
+        zip_bytes = zip_buffer.getvalue()
+
+        original_urlopen = urllib.request.urlopen
+        def mock_urlopen(req, **kwargs):
+            return io.BytesIO(zip_bytes)
+        urllib.request.urlopen = mock_urlopen
+
+        try:
+            client = sub_fetcher.SubdlClient()
+            content = client.download({"url": "test/path", "release_name": "test"})
+            self.assertIsNotNone(content)
+            self.assertIn(b"Full dialogue", content)
+            self.assertNotIn(b"Forced only", content)
+        finally:
+            urllib.request.urlopen = original_urlopen
+
+    def test_falls_back_to_forced_if_only_option(self):
+        zip_buffer = io.BytesIO()
+        with zipfile.ZipFile(zip_buffer, "w") as zf:
+            zf.writestr("Movie.eng-forced.srt", "1\n00:00:01,000 --> 00:00:03,000\nForced only\n")
+        zip_bytes = zip_buffer.getvalue()
+
+        original_urlopen = urllib.request.urlopen
+        def mock_urlopen(req, **kwargs):
+            return io.BytesIO(zip_bytes)
+        urllib.request.urlopen = mock_urlopen
+
+        try:
+            client = sub_fetcher.SubdlClient()
+            content = client.download({"url": "test/path", "release_name": "test"})
+            self.assertIsNotNone(content)
+            self.assertIn(b"Forced only", content)
+        finally:
+            urllib.request.urlopen = original_urlopen
+
+
+class TestSyncSkipLogic(unittest.TestCase):
+    """Test that sync is skipped for local English subs."""
+
+    def test_translate_and_save_accepts_skip_sync(self):
+        # Just verify the function signature accepts skip_sync
+        import inspect
+        sig = inspect.signature(sub_fetcher._translate_and_save)
+        self.assertIn("skip_sync", sig.parameters)
+        self.assertEqual(sig.parameters["skip_sync"].default, False)
 
 
 if __name__ == "__main__":

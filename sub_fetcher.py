@@ -645,13 +645,18 @@ class SubdlClient:
             with urllib.request.urlopen(req, timeout=30) as resp:
                 zip_data = resp.read()
 
-            # Extract first .srt from ZIP
+            # Extract best .srt from ZIP (prefer non-forced)
             with zipfile.ZipFile(io.BytesIO(zip_data)) as zf:
-                for name in zf.namelist():
-                    if name.lower().endswith(".srt"):
-                        content = zf.read(name)
-                        log.info(f"  Subdl downloaded: {name} from {sub_info.get('release_name', '?')}")
-                        return content
+                srt_files = [n for n in zf.namelist() if n.lower().endswith(".srt")]
+                forced_tags = ["forced", "signs", "songs"]
+                non_forced = [n for n in srt_files if not any(t in n.lower() for t in forced_tags)]
+                best = non_forced[0] if non_forced else (srt_files[0] if srt_files else None)
+                if best:
+                    content = zf.read(best)
+                    if non_forced and len(srt_files) > len(non_forced):
+                        log.info(f"  Subdl: skipped forced subs, using: {best}")
+                    log.info(f"  Subdl downloaded: {best} from {sub_info.get('release_name', '?')}")
+                    return content
 
             log.warning(f"  Subdl ZIP contains no .srt files")
             return None
@@ -706,7 +711,12 @@ class SubdlClient:
         for sub in results:
             score = 0
             release = (sub.get("release_name", "") or "").lower()
+            sub_name = (sub.get("name", "") or "").lower()
             sub_tokens = set(re.findall(r"[a-zA-Z0-9]+", release))
+
+            # Penalize forced/signs-only subs heavily
+            if any(tag in release or tag in sub_name for tag in ["forced", "signs", "songs", "sdh", "hi-only"]):
+                score -= 200
 
             # Exact filename match
             if video_base in release:
@@ -734,10 +744,17 @@ class SubdlClient:
         for i, (score, sub) in enumerate(scored[:max_tries]):
             time.sleep(DELAY_BETWEEN_API_CALLS)
             content = self.download(sub)
-            if content and not is_placeholder_sub(content):
-                return content
-            elif content:
+            if not content:
+                continue
+            if is_placeholder_sub(content):
                 log.warning(f"  Subdl result {i+1} looks like placeholder, trying next")
+                continue
+            # Reject forced/incomplete subs (fewer than 10 dialogue blocks)
+            block_count = len(re.findall(rb"\d+\r?\n\d{2}:\d{2}:\d{2}", content))
+            if block_count < 10:
+                log.warning(f"  Subdl result {i+1} has only {block_count} blocks (likely forced/signs-only), trying next")
+                continue
+            return content
 
         return None
 
@@ -1146,9 +1163,10 @@ def _save_sub_and_update_state(video_path, sub_path, source, state):
     save_state(state)
 
 
-def _translate_and_save(eng_content, video_path, state, silent=False):
+def _translate_and_save(eng_content, video_path, state, silent=False, skip_sync=False):
     """Translate English content to Italian and save. Returns True on success.
-    Also saves the English subtitle as .en.srt alongside the Italian one."""
+    Also saves the English subtitle as .en.srt alongside the Italian one.
+    skip_sync=True when the English sub is already local (timecodes match the video)."""
     if isinstance(eng_content, bytes):
         eng_text = eng_content.decode("utf-8", errors="ignore")
     elif isinstance(eng_content, str) and os.path.isfile(eng_content):
@@ -1186,7 +1204,10 @@ def _translate_and_save(eng_content, video_path, state, silent=False):
     with open(sub_path, "w", encoding="utf-8") as f:
         f.write(translated_srt)
 
-    sync_subtitle(video_path, sub_path)
+    if skip_sync:
+        log.info(f"  Skipping sync (local English sub, timecodes already correct)")
+    else:
+        sync_subtitle(video_path, sub_path)
 
     # Get actual cost from state (updated by translate_srt_with_claude)
     actual_state = load_state()
@@ -1230,7 +1251,7 @@ def do_download(video_path, state, silent=False):
             log.info(f"  Found existing English sub: {existing['path']}, translating...")
             if not silent:
                 tg_send(f"📖 Sub ENG trovato nella cartella, traduco in ITA...\n<b>{friendly_name(video_path)}</b>")
-            if _translate_and_save(existing["path"], video_path, state, silent=silent):
+            if _translate_and_save(existing["path"], video_path, state, silent=silent, skip_sync=True):
                 return True
 
     # =================================================================
@@ -1313,7 +1334,23 @@ def do_download(video_path, state, silent=False):
     if os_logged_in:
         client.logout()
 
-    if _translate_and_save(eng_content, video_path, state, silent=silent):
+    # Sync the downloaded English sub to video audio BEFORE translating
+    # so both .en.srt and .it.srt end up with correct timecodes
+    en_srt_path = os.path.splitext(video_path)[0] + ".en.srt"
+    try:
+        if isinstance(eng_content, bytes):
+            with open(en_srt_path, "wb") as f:
+                f.write(eng_content)
+        else:
+            with open(en_srt_path, "w", encoding="utf-8") as f:
+                f.write(eng_content)
+        log.info(f"  Saved English sub: {os.path.basename(en_srt_path)}")
+        sync_subtitle(video_path, en_srt_path)
+    except Exception as e:
+        log.warning(f"  Failed to save/sync English sub: {e}")
+
+    # Translate from the synced .en.srt (skip_sync=True: timecodes already correct)
+    if _translate_and_save(en_srt_path, video_path, state, silent=silent, skip_sync=True):
         return True
 
     state["asked"][video_path] = {"time": datetime.now().isoformat(), "status": "failed"}

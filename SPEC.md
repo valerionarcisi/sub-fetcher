@@ -81,6 +81,11 @@ Uses `ffprobe` to inspect audio stream metadata. Checks `language` tag for "ita"
 ### Subtitle Sync (`sync_subtitle`)
 Uses `ffsubsync` to align subtitle timecodes to the video's audio track via Voice Activity Detection. Analyzes when speech occurs in the audio and aligns subtitle timecodes accordingly. Calculates both time offset (seconds) and framerate scale factor for different video releases. Uses `os.system()` shell execution (not `subprocess.run` with pipes, which interferes with ffsubsync's `rich` library). Non-blocking: if sync fails, the unsynchronized subtitle is kept. Timeout: 5 minutes.
 
+**Sync strategy:**
+- **Downloaded subs (Subdl/OS)**: Sync `.en.srt` to audio FIRST, then translate to `.it.srt` preserving synced timecodes.
+- **Local `.en.srt` already present**: Skip sync (timecodes already match the video), translate directly.
+- The `/sync` command re-syncs existing `.it.srt` files on demand.
+
 ### Dual Subtitle Save
 When translating English subtitles, both versions are saved:
 - `video.en.srt` — original English
@@ -88,6 +93,12 @@ When translating English subtitles, both versions are saved:
 
 ### VIP Placeholder Detection (`is_placeholder_sub`)
 Rejects fake subtitles by checking for known ad patterns ("opensubtitles", "vip member", "osdb.link"), fewer than 3 blocks, or single blocks spanning >10 minutes. `_download_first_valid()` tries up to 5 results before giving up.
+
+### Forced/Signs-Only Sub Rejection
+Subtitles that only contain foreign language signs or forced dialogue (e.g. `eng-forced.srt`) are rejected:
+- **Scoring penalty**: -200 points for subs with "forced", "signs", "songs" in release name
+- **ZIP extraction**: Prefers non-forced `.srt` files within ZIP archives
+- **Block count check**: Rejects downloaded subs with fewer than 10 dialogue blocks (forced subs typically have very few)
 
 ### IMDB ID Discovery (`find_imdb_id`)
 Searches `.nfo` files (Sonarr/Radarr) in the video's directory and parent directory. Extracts IMDB ID via regex `tt\d{7,}`. Used by both Subdl and OpenSubtitles for more accurate search.
@@ -168,7 +179,7 @@ During batch downloads, per-file Telegram messages are suppressed. Only the fina
 ## Testing
 Run: `python3 test_sub_fetcher.py -v`
 
-Test coverage (37 tests):
+Test coverage (43 tests):
 - `find_imdb_id`: NFO parsing
 - `detect_language_from_srt`: Italian/English/unknown detection
 - `find_existing_srt`: English, generic, missing, Italian-tagged SRT
@@ -179,3 +190,6 @@ Test coverage (37 tests):
 - `_progress_bar`: Progress bar rendering
 - `has_italian_audio`: Mock ffprobe with Italian/English/no-tags/missing
 - `SubdlClient`: ZIP extraction, empty ZIP, lang map, missing API key
+- `SubdlForcedFiltering`: Scoring penalty, block count rejection
+- `SubdlZipPreferNonForced`: ZIP non-forced preference, forced fallback
+- `SyncSkipLogic`: skip_sync parameter acceptance
