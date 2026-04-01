@@ -962,16 +962,21 @@ CLAUDE_OUTPUT_PRICE = 15.0  # $15/M output tokens
 
 def estimate_translation_cost(srt_content):
     """Estimate the Claude API cost for translating an SRT file.
-    Returns (estimated_cost_usd, num_blocks)."""
+    Returns (estimated_cost_usd, num_blocks).
+
+    Calibrated on real usage data: output tokens ~ input tokens * 1.09,
+    but output costs 5x more than input so the output dominates the total.
+    A 15% safety margin is added to avoid systematic underestimation."""
     blocks = parse_srt(srt_content)
     if not blocks:
         return 0.0, 0
-    # Rough token estimate: ~1.3 tokens per word, subtitle text + prompt overhead
     total_text = " ".join(text for _, _, text in blocks if text.strip())
     word_count = len(total_text.split())
-    input_tokens = int(word_count * 1.3) + (len(blocks) // 100 + 1) * 150  # prompt overhead per batch
-    output_tokens = int(input_tokens * 1.1)  # output is ~same size (translation)
-    cost = (input_tokens * CLAUDE_INPUT_PRICE + output_tokens * CLAUDE_OUTPUT_PRICE) / 1_000_000
+    num_batches = len(blocks) // 100 + 1
+    input_tokens = int(word_count * 1.3) + num_batches * 150
+    output_tokens = int(input_tokens * 1.15)  # Italian tends to be slightly longer
+    raw_cost = (input_tokens * CLAUDE_INPUT_PRICE + output_tokens * CLAUDE_OUTPUT_PRICE) / 1_000_000
+    cost = raw_cost * 1.15  # 15% safety margin based on observed real vs estimated ratio
     return cost, len(blocks)
 
 
