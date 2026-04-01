@@ -1695,9 +1695,10 @@ def process_callbacks(state, excludes):
                 continue
 
             if text == "/status":
-                pending = sum(1 for v in state["asked"].values() if v["status"] == "pending")
-                downloaded = len(state["downloaded"])
-                failed = sum(1 for v in state["asked"].values() if v["status"] == "failed")
+                fresh = load_state()
+                pending = sum(1 for v in fresh["asked"].values() if v["status"] == "pending")
+                downloaded = len(fresh["downloaded"])
+                failed = sum(1 for v in fresh["asked"].values() if v["status"] == "failed")
                 excluded = len(excludes)
                 tg_send(
                     f"📊 <b>Status</b>\n\n"
@@ -1714,7 +1715,7 @@ def process_callbacks(state, excludes):
                 tg_send(f"🔍 Trovati {len(missing)} video senza sub ITA")
 
             elif text == "/costs":
-                costs = state.get("claude_costs", {})
+                costs = load_state().get("claude_costs", {})
                 total_cost = costs.get("total_cost_usd", 0.0)
                 translations = costs.get("translations", 0)
                 input_t = costs.get("total_input_tokens", 0)
