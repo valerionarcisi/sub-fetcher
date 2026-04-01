@@ -206,12 +206,21 @@ Type any text in Telegram to search. Handles dots/underscores in filenames (e.g.
 ## File Structure
 ```
 /app/sub_fetcher.py          # Main application
-/config/state.json           # Persistent state (incl. claude_costs)
+/config/state.json           # Persistent state (asked, downloaded, last_offset, claude_costs)
+/config/batches.json         # Pending download/translate batches (separate file to avoid race conditions)
 /config/exclude_folders.txt  # Excluded folders list
 /config/sub_fetcher.log      # Application log
 /media/series/               # Series (read-only mount)
 /media/films/                # Films (read-only mount)
 ```
+
+## Thread Safety
+
+The main loop and the queue worker run in separate threads and both read/write persistent state. To avoid race conditions:
+
+- `state.json` is owned by the main thread. The queue worker loads it locally at job start, makes changes, and saves it. The main thread also saves it every 5 seconds (for `last_offset` persistence).
+- `batches.json` is owned independently: any thread reads/writes it via `load_batches()`/`save_batches()`. Since batches are only written at discrete moments (job complete, scan notify) and read only on button press, there is no write contention.
+- The previous bug: batches were stored inside `state["batches"]`. The main thread's unconditional `save_state()` call at the end of `process_callbacks` used a stale in-memory state without the queue worker's newly-added batches, silently wiping them. Moving batches to a separate file eliminates this entirely.
 
 ## Testing
 Run: `python3 test_sub_fetcher.py -v`

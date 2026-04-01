@@ -66,6 +66,7 @@ DEFAULT_EXCLUDES = ["Boris"]
 
 # State
 STATE_FILE = "/config/state.json"
+BATCHES_FILE = "/config/batches.json"
 LOG_FILE = "/config/sub_fetcher.log"
 
 # Timing
@@ -117,6 +118,26 @@ def save_state(state):
             json.dump(state, f, indent=2, default=str)
     except Exception as e:
         log.error(f"Failed to save state: {e}")
+
+
+def load_batches():
+    """Load pending download/translate batches from separate file (thread-safe)."""
+    if os.path.exists(BATCHES_FILE):
+        try:
+            with open(BATCHES_FILE, "r") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+
+def save_batches(batches):
+    """Persist batches independently of main state to avoid race conditions."""
+    try:
+        with open(BATCHES_FILE, "w") as f:
+            json.dump(batches, f, indent=2, default=str)
+    except Exception as e:
+        log.error(f"Failed to save batches: {e}")
 
 
 # =============================================================================
@@ -1479,12 +1500,14 @@ def _send_batch_message(folder, paths, state):
     if result and result.get("ok"):
         msg_id = result["result"]["message_id"]
 
-    state.setdefault("batches", {})[batch_hash] = {
+    batches = load_batches()
+    batches[batch_hash] = {
         "paths": paths,
         "folder": folder,
         "time": datetime.now().isoformat(),
         "msg_id": msg_id,
     }
+    save_batches(batches)
 
     for p in paths:
         path_hash = str(abs(hash(p)))[:8]
@@ -1551,7 +1574,8 @@ def process_callbacks(state, excludes):
             # Handle batch callbacks
             if action in ("batch_yes", "batch_no", "grp_exclude", "batch_translate", "batch_keep_en"):
                 state = load_state()
-                batch = state.get("batches", {}).get(path_hash)
+                batches = load_batches()
+                batch = batches.get(path_hash)
                 if not batch:
                     tg_answer_callback(cb_id, "⚠️ Batch non trovato")
                     continue
@@ -1564,8 +1588,8 @@ def process_callbacks(state, excludes):
                             f"[░░░░░░░░░░] 0%\n"
                             f"📊 0/{len(batch['paths'])}")
                     download_queue.put({"type": "translate", "paths": batch["paths"], "msg_id": msg_id})
-                    state.get("batches", {}).pop(path_hash, None)
-                    save_state(state)
+                    batches.pop(path_hash, None)
+                    save_batches(batches)
                     continue
 
                 elif action == "batch_keep_en":
@@ -1574,7 +1598,8 @@ def process_callbacks(state, excludes):
                         state["asked"][p] = {"time": datetime.now().isoformat(), "status": "en_only"}
                     if msg_id:
                         tg_edit_message(msg_id, f"🇬🇧 Sub inglesi mantenuti senza traduzione.\nPuoi tradurre in seguito con /translate")
-                    state.get("batches", {}).pop(path_hash, None)
+                    batches.pop(path_hash, None)
+                    save_batches(batches)
                     save_state(state)
                     continue
 
@@ -1610,7 +1635,8 @@ def process_callbacks(state, excludes):
                     if msg_id:
                         tg_edit_message(msg_id, f"⏭ Batch saltato.\nRichiederò tra 3 giorni.")
 
-                state.get("batches", {}).pop(path_hash, None)
+                batches.pop(path_hash, None)
+                save_batches(batches)
                 save_state(state)
                 continue
 
@@ -1852,13 +1878,13 @@ def search_and_offer(query, state):
         # Create a unique hash for this batch
         batch_hash = str(abs(hash(query + str(len(without_sub)))))[:8]
 
-        # Store the batch in state
-        state.setdefault("batches", {})[batch_hash] = {
+        batches = load_batches()
+        batches[batch_hash] = {
             "paths": without_sub,
             "query": query,
             "time": datetime.now().isoformat(),
         }
-        save_state(state)
+        save_batches(batches)
 
         keyboard = {
             "inline_keyboard": [
@@ -2034,11 +2060,12 @@ def do_batch_download(paths, state, progress_msg_id=None):
         summary += f"\n\n💰 <b>Costo traduzione stimato: ${total_cost:.2f}</b> ({total_blocks} blocchi)"
 
         translate_hash = str(abs(hash(tuple(en_paths))))[:8]
-        state.setdefault("batches", {})[translate_hash] = {
+        batches = load_batches()
+        batches[translate_hash] = {
             "paths": en_paths,
             "type": "translate",
         }
-        save_state(state)
+        save_batches(batches)
 
         keyboard = {"inline_keyboard": [
             [
@@ -2185,8 +2212,9 @@ def _queue_worker(state_ref):
                         with open(en_srt, "r", encoding="utf-8", errors="ignore") as f:
                             cost, blocks = estimate_translation_cost(f.read())
                     tr_hash = str(abs(hash(video_path)))[:8]
-                    state.setdefault("batches", {})[tr_hash] = {"paths": [video_path], "type": "translate"}
-                    save_state(state)
+                    batches = load_batches()
+                    batches[tr_hash] = {"paths": [video_path], "type": "translate"}
+                    save_batches(batches)
                     keyboard = {"inline_keyboard": [
                         [
                             {"text": f"🤖 Traduci (${cost:.2f})", "callback_data": f"batch_translate:{tr_hash}"},
