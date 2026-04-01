@@ -1757,44 +1757,22 @@ def process_callbacks(state, excludes):
                 if not query:
                     tg_send("Usa: <code>/sync nome serie o film</code>\nEs: <code>/sync Pluribus</code> o <code>/sync The Chosen</code>\nOppure <code>/sync all</code> per tutti.")
                 else:
-                    do_sync(query, state)
+                    pos = queue_position()
+                    result = tg_send(
+                        f"🔄 Sync <b>{query}</b> in coda..."
+                        + (f"\n⏳ Posizione {pos + 1}" if pos > 0 else "")
+                    )
+                    msg_id = result["result"]["message_id"] if result and result.get("ok") else None
+                    download_queue.put({"type": "sync", "query": query, "msg_id": msg_id})
 
             elif text == "/cleanup":
-                tg_send("🧹 Scansione sottotitoli placeholder in corso...")
-                removed = 0
-                requeued = 0
-                for media_path in [FILMS_PATH, SERIES_PATH]:
-                    if not os.path.exists(media_path):
-                        continue
-                    for root, dirs, files in os.walk(media_path):
-                        for f in files:
-                            if f.endswith(".it.srt"):
-                                srt_path = os.path.join(root, f)
-                                try:
-                                    with open(srt_path, "rb") as fh:
-                                        content = fh.read()
-                                    if is_placeholder_sub(content):
-                                        os.remove(srt_path)
-                                        removed += 1
-                                        log.info(f"  🗑 Placeholder rimosso: {f}")
-                                        # Find matching video and remove from downloaded state
-                                        video_base = srt_path.rsplit(".it.srt", 1)[0]
-                                        for ext in VIDEO_EXTENSIONS:
-                                            video_candidate = video_base + ext
-                                            if os.path.exists(video_candidate):
-                                                state["downloaded"].pop(video_candidate, None)
-                                                state["asked"].pop(video_candidate, None)
-                                                requeued += 1
-                                                break
-                                except Exception as e:
-                                    log.error(f"  Errore leggendo {srt_path}: {e}")
-                save_state(state)
-                tg_send(
-                    f"🧹 <b>Cleanup completato</b>\n\n"
-                    f"🗑 Placeholder rimossi: {removed}\n"
-                    f"🔄 Video rimessi in coda: {requeued}\n\n"
-                    f"{'Alla prossima scansione verranno cercati di nuovo.' if requeued else 'Nessun placeholder trovato.'}"
+                pos = queue_position()
+                result = tg_send(
+                    f"🧹 Cleanup in coda..."
+                    + (f"\n⏳ Posizione {pos + 1}" if pos > 0 else "")
                 )
+                msg_id = result["result"]["message_id"] if result and result.get("ok") else None
+                download_queue.put({"type": "cleanup", "msg_id": msg_id})
 
             elif text.startswith("/sub ") or (not text.startswith("/") and len(text) >= 3):
                 # Manual search: user typed a movie/series name
@@ -1942,7 +1920,7 @@ def search_and_offer(query, state):
         save_state(state)
 
 
-def do_sync(query, state):
+def do_sync(query, state, progress_msg_id=None):
     """Sync subtitles for a specific series/film or all."""
     is_all = query.lower() == "all"
     query_lower = query.lower()
@@ -1969,14 +1947,24 @@ def do_sync(query, state):
                         break
 
     if not pairs:
-        tg_send(f"❌ Nessun sub ITA trovato per '<b>{query}</b>'")
+        msg = f"❌ Nessun sub ITA trovato per '<b>{query}</b>'"
+        if progress_msg_id:
+            tg_edit_message(progress_msg_id, msg)
+        else:
+            tg_send(msg)
         return
 
-    result = tg_send(
-        f"🔄 Sync <b>{query}</b>: {len(pairs)} sottotitoli...\n"
-        f"[{'░' * 10}] 0%"
-    )
-    msg_id = result["result"]["message_id"] if result and result.get("ok") else None
+    msg_id = progress_msg_id
+    if not msg_id:
+        result = tg_send(
+            f"🔄 Sync <b>{query}</b>: {len(pairs)} sottotitoli...\n"
+            f"[{'░' * 10}] 0%"
+        )
+        msg_id = result["result"]["message_id"] if result and result.get("ok") else None
+    else:
+        tg_edit_message(msg_id,
+            f"🔄 Sync <b>{query}</b>: {len(pairs)} sottotitoli...\n"
+            f"[{'░' * 10}] 0%")
 
     synced = 0
     failed = 0
@@ -2000,6 +1988,47 @@ def do_sync(query, state):
     )
     if msg_id:
         tg_edit_message(msg_id, summary)
+    else:
+        tg_send(summary)
+
+
+def do_cleanup(state, progress_msg_id=None):
+    """Scan all .it.srt files, remove placeholders and re-queue the matching videos."""
+    removed = 0
+    requeued = 0
+    for media_path in [FILMS_PATH, SERIES_PATH]:
+        if not os.path.exists(media_path):
+            continue
+        for root, dirs, files in os.walk(media_path):
+            for f in files:
+                if f.endswith(".it.srt"):
+                    srt_path = os.path.join(root, f)
+                    try:
+                        with open(srt_path, "rb") as fh:
+                            content = fh.read()
+                        if is_placeholder_sub(content):
+                            os.remove(srt_path)
+                            removed += 1
+                            log.info(f"  🗑 Placeholder rimosso: {f}")
+                            video_base = srt_path.rsplit(".it.srt", 1)[0]
+                            for ext in VIDEO_EXTENSIONS:
+                                video_candidate = video_base + ext
+                                if os.path.exists(video_candidate):
+                                    state["downloaded"].pop(video_candidate, None)
+                                    state["asked"].pop(video_candidate, None)
+                                    requeued += 1
+                                    break
+                    except Exception as e:
+                        log.error(f"  Errore leggendo {srt_path}: {e}")
+    save_state(state)
+    summary = (
+        f"🧹 <b>Cleanup completato</b>\n\n"
+        f"🗑 Placeholder rimossi: {removed}\n"
+        f"🔄 Video rimessi in coda: {requeued}\n\n"
+        f"{'Alla prossima scansione verranno cercati di nuovo.' if requeued else 'Nessun placeholder trovato.'}"
+    )
+    if progress_msg_id:
+        tg_edit_message(progress_msg_id, summary)
     else:
         tg_send(summary)
 
@@ -2197,6 +2226,15 @@ def _queue_worker(state_ref):
                 msg_id = job.get("msg_id")
                 log.info(f"  Queue: translating batch of {len(paths)} files")
                 do_batch_translate(paths, state, progress_msg_id=msg_id)
+            elif job_type == "sync":
+                query = job["query"]
+                msg_id = job.get("msg_id")
+                log.info(f"  Queue: sync '{query}'")
+                do_sync(query, state, progress_msg_id=msg_id)
+            elif job_type == "cleanup":
+                msg_id = job.get("msg_id")
+                log.info("  Queue: cleanup placeholders")
+                do_cleanup(state, progress_msg_id=msg_id)
             else:
                 video_path = job["path"]
                 msg_id = job.get("msg_id")
