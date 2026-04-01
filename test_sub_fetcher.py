@@ -702,5 +702,287 @@ class TestQueueTranslateJobType(unittest.TestCase):
         sub_fetcher.download_queue.task_done()
 
 
+# =============================================================================
+# NEW TESTS — batches.json, do_cleanup, do_sync, queue job types
+# =============================================================================
+
+class TestLoadSaveBatches(unittest.TestCase):
+    """Test that load_batches/save_batches correctly persist to a separate file."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self._orig_batches = sub_fetcher.BATCHES_FILE
+        sub_fetcher.BATCHES_FILE = os.path.join(self.tmpdir, "batches.json")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir)
+        sub_fetcher.BATCHES_FILE = self._orig_batches
+
+    def test_returns_empty_dict_when_file_missing(self):
+        batches = sub_fetcher.load_batches()
+        self.assertEqual(batches, {})
+
+    def test_roundtrip_save_and_load(self):
+        data = {"abc12345": {"paths": ["/media/films/Movie.mkv"], "type": "translate"}}
+        sub_fetcher.save_batches(data)
+        loaded = sub_fetcher.load_batches()
+        self.assertEqual(loaded, data)
+
+    def test_save_multiple_batches(self):
+        sub_fetcher.save_batches({"hash1": {"paths": ["/a.mkv"]}})
+        sub_fetcher.save_batches({"hash2": {"paths": ["/b.mkv"]}})
+        # Second save overwrites first — caller is responsible for merging
+        loaded = sub_fetcher.load_batches()
+        self.assertIn("hash2", loaded)
+
+    def test_save_does_not_touch_state_json(self):
+        state_file = os.path.join(self.tmpdir, "state.json")
+        sub_fetcher.save_batches({"h": {"paths": []}})
+        self.assertFalse(os.path.exists(state_file))
+
+    def test_batches_independent_from_state(self):
+        """Saving state must NOT wipe batches.json."""
+        sub_fetcher.save_batches({"abc": {"paths": ["/x.mkv"], "type": "translate"}})
+
+        orig_state = sub_fetcher.STATE_FILE
+        sub_fetcher.STATE_FILE = os.path.join(self.tmpdir, "state.json")
+        try:
+            state = {"asked": {}, "downloaded": {}, "last_offset": 0}
+            sub_fetcher.save_state(state)
+            # Batches must still be there after save_state
+            loaded = sub_fetcher.load_batches()
+            self.assertIn("abc", loaded)
+        finally:
+            sub_fetcher.STATE_FILE = orig_state
+
+
+class TestDoCleanup(unittest.TestCase):
+    """Test that do_cleanup removes placeholder subs and updates state."""
+
+    _PLACEHOLDER = (
+        b"1\n00:00:01,000 --> 00:00:03,000\n"
+        b"Subtitles by VIP Member - www.BestSubs.com\n\n"
+    )
+    _REAL_SUB = (
+        b"1\n00:00:01,000 --> 00:00:03,000\nDialogue line here\n\n"
+        b"2\n00:00:04,000 --> 00:00:06,000\nAnother line\n\n"
+        b"3\n00:00:07,000 --> 00:00:09,000\nAnd a third line\n\n"
+    )
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self._orig_films = sub_fetcher.FILMS_PATH
+        self._orig_series = sub_fetcher.SERIES_PATH
+        sub_fetcher.FILMS_PATH = os.path.join(self.tmpdir, "films")
+        sub_fetcher.SERIES_PATH = os.path.join(self.tmpdir, "series")
+        os.makedirs(sub_fetcher.FILMS_PATH)
+        os.makedirs(sub_fetcher.SERIES_PATH)
+
+        self._tg_calls = []
+        self._orig_tg_send = sub_fetcher.tg_send
+        self._orig_tg_edit = sub_fetcher.tg_edit_message
+        sub_fetcher.tg_send = lambda *a, **kw: self._tg_calls.append(("send", a))
+        sub_fetcher.tg_edit_message = lambda *a, **kw: self._tg_calls.append(("edit", a))
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir)
+        sub_fetcher.FILMS_PATH = self._orig_films
+        sub_fetcher.SERIES_PATH = self._orig_series
+        sub_fetcher.tg_send = self._orig_tg_send
+        sub_fetcher.tg_edit_message = self._orig_tg_edit
+
+    def _create_video_and_sub(self, folder, basename, sub_content):
+        d = os.path.join(sub_fetcher.FILMS_PATH, folder)
+        os.makedirs(d, exist_ok=True)
+        video = os.path.join(d, basename + ".mkv")
+        srt = os.path.join(d, basename + ".it.srt")
+        open(video, "w").close()
+        with open(srt, "wb") as f:
+            f.write(sub_content)
+        return video, srt
+
+    def test_removes_placeholder_sub(self):
+        video, srt = self._create_video_and_sub("Movie (2024)", "Movie.2024", self._PLACEHOLDER)
+        state = {"asked": {}, "downloaded": {video: {"sub": srt}}}
+        sub_fetcher.do_cleanup(state)
+        self.assertFalse(os.path.exists(srt))
+
+    def test_leaves_real_sub_intact(self):
+        video, srt = self._create_video_and_sub("Movie (2024)", "Movie.2024", self._REAL_SUB)
+        state = {"asked": {}, "downloaded": {}}
+        sub_fetcher.do_cleanup(state)
+        self.assertTrue(os.path.exists(srt))
+
+    def test_removes_video_from_downloaded_state(self):
+        video, srt = self._create_video_and_sub("Movie (2024)", "Movie.2024", self._PLACEHOLDER)
+        state = {"asked": {video: {"status": "yes"}}, "downloaded": {video: {"sub": srt}}}
+        sub_fetcher.do_cleanup(state)
+        self.assertNotIn(video, state["downloaded"])
+        self.assertNotIn(video, state["asked"])
+
+    def test_uses_progress_msg_id_when_provided(self):
+        self._create_video_and_sub("Movie (2024)", "Movie.2024", self._PLACEHOLDER)
+        state = {"asked": {}, "downloaded": {}}
+        sub_fetcher.do_cleanup(state, progress_msg_id=42)
+        edits = [c for c in self._tg_calls if c[0] == "edit"]
+        self.assertTrue(len(edits) > 0)
+        self.assertEqual(edits[-1][1][0], 42)
+
+    def test_sends_message_when_no_msg_id(self):
+        self._create_video_and_sub("Movie (2024)", "Movie.2024", self._PLACEHOLDER)
+        state = {"asked": {}, "downloaded": {}}
+        sub_fetcher.do_cleanup(state, progress_msg_id=None)
+        sends = [c for c in self._tg_calls if c[0] == "send"]
+        self.assertTrue(len(sends) > 0)
+
+
+class TestDoSync(unittest.TestCase):
+    """Test do_sync dispatches correctly and respects progress_msg_id."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self._orig_series = sub_fetcher.SERIES_PATH
+        self._orig_films = sub_fetcher.FILMS_PATH
+        sub_fetcher.SERIES_PATH = os.path.join(self.tmpdir, "series")
+        sub_fetcher.FILMS_PATH = os.path.join(self.tmpdir, "films")
+        os.makedirs(sub_fetcher.SERIES_PATH)
+        os.makedirs(sub_fetcher.FILMS_PATH)
+
+        self._tg_calls = []
+        self._orig_tg_send = sub_fetcher.tg_send
+        self._orig_tg_edit = sub_fetcher.tg_edit_message
+        self._orig_sync = sub_fetcher.sync_subtitle
+        sub_fetcher.tg_send = lambda *a, **kw: self._tg_calls.append(("send", a)) or {"ok": True, "result": {"message_id": 99}}
+        sub_fetcher.tg_edit_message = lambda *a, **kw: self._tg_calls.append(("edit", a))
+        sub_fetcher.sync_subtitle = lambda v, s, **kw: {"ok": True, "score": 100, "offset": 0.0}
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir)
+        sub_fetcher.SERIES_PATH = self._orig_series
+        sub_fetcher.FILMS_PATH = self._orig_films
+        sub_fetcher.tg_send = self._orig_tg_send
+        sub_fetcher.tg_edit_message = self._orig_tg_edit
+        sub_fetcher.sync_subtitle = self._orig_sync
+
+    def _create_pair(self, folder, basename):
+        d = os.path.join(sub_fetcher.SERIES_PATH, folder)
+        os.makedirs(d, exist_ok=True)
+        video = os.path.join(d, basename + ".mkv")
+        srt = os.path.join(d, basename + ".it.srt")
+        open(video, "w").close()
+        open(srt, "w").close()
+        return video, srt
+
+    def test_accepts_progress_msg_id_param(self):
+        import inspect
+        sig = inspect.signature(sub_fetcher.do_sync)
+        self.assertIn("progress_msg_id", sig.parameters)
+
+    def test_sends_not_found_when_no_matching_srt(self):
+        state = {}
+        sub_fetcher.do_sync("NonExistent", state)
+        texts = " ".join(str(c) for c in self._tg_calls)
+        self.assertIn("nonexistent", texts.lower())
+
+    def test_uses_progress_msg_id_on_not_found(self):
+        state = {}
+        sub_fetcher.do_sync("NonExistent", state, progress_msg_id=55)
+        edits = [c for c in self._tg_calls if c[0] == "edit"]
+        self.assertTrue(len(edits) > 0)
+        self.assertEqual(edits[0][1][0], 55)
+
+    def test_syncs_matching_pair_and_reports_result(self):
+        self._create_pair("Pluribus", "Pluribus.S01E01")
+        state = {}
+        sub_fetcher.do_sync("Pluribus", state, progress_msg_id=10)
+        edits = [c for c in self._tg_calls if c[0] == "edit"]
+        # Last edit should be the summary
+        last_text = edits[-1][1][1]
+        self.assertIn("Sync completato", last_text)
+        self.assertIn("1", last_text)
+
+    def test_sync_all_finds_all_subs(self):
+        self._create_pair("ShowA", "ShowA.S01E01")
+        self._create_pair("ShowB", "ShowB.S01E01")
+        synced_calls = []
+        sub_fetcher.sync_subtitle = lambda v, s, **kw: synced_calls.append(v) or {"ok": True, "score": 100, "offset": 0.0}
+        sub_fetcher.do_sync("all", {})
+        self.assertEqual(len(synced_calls), 2)
+
+
+class TestQueueSyncCleanupJobTypes(unittest.TestCase):
+    """Test that queue accepts and correctly structures sync/cleanup jobs."""
+
+    def test_queue_accepts_sync_job(self):
+        sub_fetcher.download_queue.put({"type": "sync", "query": "Pluribus", "msg_id": 42})
+        job = sub_fetcher.download_queue.get_nowait()
+        self.assertEqual(job["type"], "sync")
+        self.assertEqual(job["query"], "Pluribus")
+        self.assertEqual(job["msg_id"], 42)
+        sub_fetcher.download_queue.task_done()
+
+    def test_queue_accepts_cleanup_job(self):
+        sub_fetcher.download_queue.put({"type": "cleanup", "msg_id": 7})
+        job = sub_fetcher.download_queue.get_nowait()
+        self.assertEqual(job["type"], "cleanup")
+        self.assertEqual(job["msg_id"], 7)
+        sub_fetcher.download_queue.task_done()
+
+    def test_do_cleanup_is_callable(self):
+        self.assertTrue(callable(sub_fetcher.do_cleanup))
+
+    def test_do_sync_is_callable(self):
+        self.assertTrue(callable(sub_fetcher.do_sync))
+
+
+class TestBatchTranslatePersistence(unittest.TestCase):
+    """Test that batch_translate entries survive a save_state() call."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self._orig_state = sub_fetcher.STATE_FILE
+        self._orig_batches = sub_fetcher.BATCHES_FILE
+        sub_fetcher.STATE_FILE = os.path.join(self.tmpdir, "state.json")
+        sub_fetcher.BATCHES_FILE = os.path.join(self.tmpdir, "batches.json")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir)
+        sub_fetcher.STATE_FILE = self._orig_state
+        sub_fetcher.BATCHES_FILE = self._orig_batches
+
+    def test_batch_survives_save_state(self):
+        """Simulates the race condition that was the root cause of 'Batch non trovato'."""
+        # Queue worker saves a batch
+        sub_fetcher.save_batches({"deadbeef": {"paths": ["/media/films/Movie.mkv"], "type": "translate"}})
+
+        # Main loop saves state (without batches) — should NOT wipe batches.json
+        state = {"asked": {}, "downloaded": {}, "last_offset": 42}
+        sub_fetcher.save_state(state)
+
+        # Batch must still be there
+        batches = sub_fetcher.load_batches()
+        self.assertIn("deadbeef", batches)
+        self.assertEqual(batches["deadbeef"]["paths"], ["/media/films/Movie.mkv"])
+
+    def test_batch_found_after_multiple_state_saves(self):
+        sub_fetcher.save_batches({"tr123": {"paths": ["/a.mkv", "/b.mkv"], "type": "translate"}})
+
+        for i in range(5):
+            sub_fetcher.save_state({"asked": {f"path_{i}": {"status": "no"}}, "downloaded": {}, "last_offset": i})
+
+        batches = sub_fetcher.load_batches()
+        self.assertIn("tr123", batches)
+
+    def test_explicit_batch_removal_works(self):
+        sub_fetcher.save_batches({"abc": {"paths": ["/x.mkv"]}, "def": {"paths": ["/y.mkv"]}})
+        batches = sub_fetcher.load_batches()
+        batches.pop("abc", None)
+        sub_fetcher.save_batches(batches)
+
+        loaded = sub_fetcher.load_batches()
+        self.assertNotIn("abc", loaded)
+        self.assertIn("def", loaded)
+
+
 if __name__ == "__main__":
     unittest.main()
