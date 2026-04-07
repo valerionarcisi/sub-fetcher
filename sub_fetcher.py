@@ -899,34 +899,51 @@ def sync_subtitle(video_path, srt_path, min_score=0):
 # SUBTITLE VALIDATION (detect VIP placeholders)
 # =============================================================================
 
-# Patterns that indicate a fake/placeholder subtitle
-PLACEHOLDER_PATTERNS = [
-    b"opensubtitles",
-    b"vip member",
-    b"osdb.link",
-    b"get subtitles",
-    b"become a member",
-    b"advertis",
+# Patterns that appear in VIP placeholder ads but (almost) never in real subs.
+# "opensubtitles" alone is too broad — real subs often credit opensubtitles.org
+# in their footer. We require a stronger signal: phrases specific to the VIP
+# upsell ads, OR a high density of placeholder keywords in a short sub.
+PLACEHOLDER_STRONG_PATTERNS = [
+    "osdb.link",
+    "become a vip",
+    "vip member",
+    "advertise your product",
+    "api.opensubtitles.org",
+    "support us and become vip",
+]
+PLACEHOLDER_WEAK_PATTERNS = [
+    "opensubtitles",
+    "advertis",
+    "get subtitles",
 ]
 
 
 def is_placeholder_sub(content):
     """Check if downloaded subtitle content is a VIP placeholder/ad."""
     try:
-        # Try to decode as text
         text = content.decode("utf-8", errors="ignore").lower()
     except Exception:
         text = str(content).lower()
 
-    # Check for known placeholder patterns
-    for pattern in PLACEHOLDER_PATTERNS:
-        if pattern.decode().lower() in text:
+    # Count actual SRT blocks first — real subs have 300-2000 blocks.
+    blocks = re.findall(r"\d+\s*\n\d{2}:\d{2}:\d{2}", text)
+    n_blocks = len(blocks)
+
+    if n_blocks < 3:
+        return True  # Too short to be real
+
+    # Strong patterns = almost certainly a placeholder, reject immediately.
+    for pattern in PLACEHOLDER_STRONG_PATTERNS:
+        if pattern in text:
             return True
 
-    # Count actual SRT blocks (number\ntimecode\ntext)
-    blocks = re.findall(r"\d+\s*\n\d{2}:\d{2}:\d{2}", text)
-    if len(blocks) < 3:
-        return True  # A real subtitle has way more than 3 blocks
+    # Weak patterns only count if the sub is also suspiciously short.
+    # A real 90-min movie sub has >=200 blocks; anything shorter with
+    # placeholder-ish keywords is almost always a fake.
+    if n_blocks < 50:
+        for pattern in PLACEHOLDER_WEAK_PATTERNS:
+            if pattern in text:
+                return True
 
     # Check if a single block spans an absurd time range (e.g., 00:00:00 --> 04:00:00)
     long_spans = re.findall(

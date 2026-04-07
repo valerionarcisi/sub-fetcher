@@ -276,6 +276,44 @@ class TestParseVideo(unittest.TestCase):
         self.assertIn("SomeMovie", result["name"])
 
 
+class TestPlaceholderDetection(unittest.TestCase):
+    def _fake_sub(self, n_blocks, footer=""):
+        lines = []
+        for i in range(1, n_blocks + 1):
+            h, m = divmod(i, 60)
+            lines.append(f"{i}\n00:{h:02d}:{m:02d},000 --> 00:{h:02d}:{m:02d},500\nLine {i}\n")
+        return ("\n".join(lines) + footer).encode("utf-8")
+
+    def test_rejects_too_short(self):
+        content = self._fake_sub(2)
+        self.assertTrue(sub_fetcher.is_placeholder_sub(content))
+
+    def test_rejects_strong_pattern_osdb(self):
+        content = self._fake_sub(500, "\nVisit osdb.link/vip for more")
+        self.assertTrue(sub_fetcher.is_placeholder_sub(content))
+
+    def test_rejects_strong_pattern_vip_member(self):
+        content = self._fake_sub(500, "\nBecome a VIP member now")
+        self.assertTrue(sub_fetcher.is_placeholder_sub(content))
+
+    def test_accepts_real_sub_with_opensubtitles_credit(self):
+        # Real sub with ~500 blocks and "opensubtitles" only in footer credits
+        content = self._fake_sub(500, "\nDownloaded from opensubtitles.org\n")
+        self.assertFalse(sub_fetcher.is_placeholder_sub(content))
+
+    def test_rejects_short_sub_with_opensubtitles_keyword(self):
+        content = self._fake_sub(10, "\nopensubtitles")
+        self.assertTrue(sub_fetcher.is_placeholder_sub(content))
+
+    def test_accepts_long_real_sub(self):
+        content = self._fake_sub(800)
+        self.assertFalse(sub_fetcher.is_placeholder_sub(content))
+
+    def test_rejects_single_block_long_span(self):
+        content = b"1\n00:00:00,000 --> 05:00:00,000\nAd\n\n2\n00:00:01,000 --> 00:00:02,000\n.\n\n3\n00:00:03,000 --> 00:00:04,000\n.\n"
+        self.assertTrue(sub_fetcher.is_placeholder_sub(content))
+
+
 class TestCascadeSearchUnit(unittest.TestCase):
     """Test _cascade_search logic with mocked OSClient."""
 
