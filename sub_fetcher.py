@@ -40,16 +40,27 @@ from queue import Queue, Empty
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
-# OpenSubtitles.org credentials (optional, anonymous works but with lower limits)
+# OpenSubtitles.com REST API v1 (new, replaces legacy XML-RPC)
+# Get an API key at https://www.opensubtitles.com/en/consumers
+OPENSUBTITLES_API_KEY = os.environ.get("OPENSUBTITLES_API_KEY", "")
+OPENSUBTITLES_API_URL = "https://api.opensubtitles.com/api/v1"
+OPENSUBTITLES_USER_AGENT = "subfetcher v1.0"
+# Legacy XML-RPC credentials kept for backwards compatibility only — unused now.
 OS_USERNAME = os.environ.get("OS_USERNAME", "")
 OS_PASSWORD = os.environ.get("OS_PASSWORD", "")
-OS_LANGUAGE = "ita"
-OS_USER_AGENT = "NASSubFetcher v1.0"
+OS_LANGUAGE = "it"  # REST v1 uses ISO 639-1 (two-letter) codes
 
 # Subdl.com API (primary subtitle provider)
 SUBDL_API_KEY = os.environ.get("SUBDL_API_KEY", "")
 SUBDL_API_URL = "https://api.subdl.com/api/v1/subtitles"
 SUBDL_DOWNLOAD_URL = "https://dl.subdl.com/subtitle"
+
+# TMDb (used to resolve title+year -> IMDb ID when no .nfo is present)
+TMDB_API_KEY = os.environ.get("TMDB_API_KEY", "")
+TMDB_API_URL = "https://api.themoviedb.org/3"
+
+# SubSource (third subtitle provider)
+SUBSOURCE_API_URL = "https://api.subsource.net/v1"
 
 # Claude API for translation (EN -> IT fallback)
 CLAUDE_API_KEY = os.environ.get("CLAUDE_API_KEY", "")
@@ -311,7 +322,7 @@ def parse_video(filepath):
     return {"type": "unknown", "name": parent}
 
 
-def find_imdb_id(video_path):
+def _find_imdb_id_from_nfo(video_path):
     """Search for IMDB ID in .nfo files (created by Sonarr/Radarr)."""
     video_dir = os.path.dirname(video_path)
     parent_dir = os.path.dirname(video_dir)
@@ -336,6 +347,56 @@ def find_imdb_id(video_path):
         except Exception:
             continue
     return None
+
+
+def tmdb_find_imdb_id(title, year=None, is_tv=False):
+    """Look up IMDb ID from TMDb using title (+ year). Returns 'ttXXXXXXX' or None."""
+    if not TMDB_API_KEY or not title:
+        return None
+    endpoint = "/search/tv" if is_tv else "/search/movie"
+    params = {"api_key": TMDB_API_KEY, "query": title, "include_adult": "false"}
+    if year and not is_tv:
+        params["year"] = str(year)
+    elif year and is_tv:
+        params["first_air_date_year"] = str(year)
+    url = f"{TMDB_API_URL}{endpoint}?{urllib.parse.urlencode(params)}"
+    try:
+        with urllib.request.urlopen(url, timeout=10) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except Exception as e:
+        log.warning(f"  TMDb search error: {e}")
+        return None
+    results = data.get("results") or []
+    if not results:
+        log.info(f"  TMDb: no match for '{title}' ({year})")
+        return None
+    tmdb_id = results[0].get("id")
+    if not tmdb_id:
+        return None
+    # Fetch external_ids to get the IMDb ID
+    ext_endpoint = f"/tv/{tmdb_id}/external_ids" if is_tv else f"/movie/{tmdb_id}/external_ids"
+    ext_url = f"{TMDB_API_URL}{ext_endpoint}?api_key={TMDB_API_KEY}"
+    try:
+        with urllib.request.urlopen(ext_url, timeout=10) as resp:
+            ext = json.loads(resp.read().decode("utf-8"))
+    except Exception as e:
+        log.warning(f"  TMDb external_ids error: {e}")
+        return None
+    imdb_id = ext.get("imdb_id")
+    if imdb_id:
+        log.info(f"  TMDb: resolved '{title}' ({year}) -> {imdb_id}")
+        return imdb_id
+    return None
+
+
+def find_imdb_id(video_path):
+    """Find IMDb ID from .nfo files first, fall back to TMDb lookup."""
+    imdb = _find_imdb_id_from_nfo(video_path)
+    if imdb:
+        return imdb
+    parsed = parse_video(video_path)
+    is_tv = parsed.get("type") == "episode"
+    return tmdb_find_imdb_id(parsed.get("name"), parsed.get("year"), is_tv=is_tv)
 
 
 def detect_language_from_srt(srt_path, sample_size=2000):
@@ -540,89 +601,138 @@ def scan_missing(state, excludes):
 # OPENSUBTITLES CLIENT
 # =============================================================================
 
+_LANG_2LETTER = {"ita": "it", "eng": "en", "it": "it", "en": "en"}
+
+
+def _to_iso2(lang):
+    return _LANG_2LETTER.get((lang or "").lower(), (lang or "en").lower()[:2])
+
+
 class OSClient:
-    API_URL = "https://api.opensubtitles.org/xml-rpc"
+    """Client for OpenSubtitles.com REST API v1.
+
+    Returns results in a legacy-compatible shape (SubFileName, MovieReleaseName,
+    IDSubtitleFile, SubFormat, SubDownloadsCnt, SubRating, MatchedBy) so that
+    the existing pick_best / _download_first_valid code keeps working.
+    """
 
     def __init__(self):
-        self.server = ServerProxy(self.API_URL)
-        self.token = None
+        self.api_key = OPENSUBTITLES_API_KEY
+        self.available = bool(self.api_key)
+        self.token = None  # kept for backwards compat with callers
 
-    def login(self):
+    def _headers(self, json_body=False):
+        h = {
+            "Api-Key": self.api_key,
+            "User-Agent": OPENSUBTITLES_USER_AGENT,
+            "Accept": "application/json",
+        }
+        if json_body:
+            h["Content-Type"] = "application/json"
+        return h
+
+    def _request(self, method, path, params=None, body=None, timeout=15):
+        if not self.available:
+            return None
+        url = f"{OPENSUBTITLES_API_URL}{path}"
+        if params:
+            url = f"{url}?{urllib.parse.urlencode(params)}"
+        data = json.dumps(body).encode("utf-8") if body is not None else None
+        req = urllib.request.Request(url, data=data, method=method, headers=self._headers(json_body=bool(body)))
         try:
-            r = self.server.LogIn(OS_USERNAME, OS_PASSWORD, OS_LANGUAGE, OS_USER_AGENT)
-            if r.get("status", "").startswith("200"):
-                self.token = r["token"]
-                log.info("OpenSubtitles.org: logged in")
-                return True
-            log.error(f"OS login failed: {r.get('status')}")
-            return False
-        except Exception as e:
-            log.error(f"OS login error: {e}")
-            return False
-
-    def logout(self):
-        if self.token:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            body_text = ""
             try:
-                self.server.LogOut(self.token)
+                body_text = e.read().decode("utf-8", errors="ignore")[:200]
             except Exception:
                 pass
-            self.token = None
+            log.warning(f"  OpenSubtitles {method} {path} HTTP {e.code}: {body_text}")
+        except Exception as e:
+            log.warning(f"  OpenSubtitles {method} {path} error: {e}")
+        return None
+
+    def login(self):
+        """No-op: REST v1 uses API key, no session token required."""
+        if self.available:
+            log.info("OpenSubtitles.com REST v1: ready")
+            return True
+        log.info("OpenSubtitles: OPENSUBTITLES_API_KEY not set, skipping")
+        return False
+
+    def logout(self):
+        pass
+
+    @staticmethod
+    def _to_legacy(item):
+        """Map a REST v1 subtitle item to the legacy XML-RPC field names."""
+        attrs = item.get("attributes", {}) or {}
+        files = attrs.get("files") or []
+        first = files[0] if files else {}
+        file_name = first.get("file_name") or attrs.get("release") or ""
+        fmt = os.path.splitext(file_name)[1].lstrip(".").lower() or "srt"
+        return {
+            "SubFileName": file_name,
+            "MovieReleaseName": attrs.get("release", ""),
+            "IDSubtitleFile": str(first.get("file_id", "")),
+            "SubFormat": fmt,
+            "SubDownloadsCnt": attrs.get("download_count", 0) or 0,
+            "SubRating": attrs.get("ratings", 0) or 0,
+            "MatchedBy": "moviehash" if attrs.get("moviehash_match") else "",
+            "_osd_attrs": attrs,
+        }
+
+    def _search(self, params):
+        resp = self._request("GET", "/subtitles", params=params)
+        if not resp:
+            return []
+        return [self._to_legacy(it) for it in (resp.get("data") or [])]
 
     def search_hash(self, file_hash, file_size):
-        try:
-            r = self.server.SearchSubtitles(self.token, [{
-                "sublanguageid": OS_LANGUAGE,
-                "moviehash": file_hash,
-                "moviebytesize": str(file_size),
-            }])
-            if r.get("status", "").startswith("200"):
-                return r.get("data", []) or []
-        except Exception as e:
-            log.error(f"OS hash search error: {e}")
-        return []
+        return self._search({"moviehash": file_hash, "languages": _to_iso2(OS_LANGUAGE)})
 
     def search_imdb(self, imdb_id, season=None, episode=None, language=None):
-        try:
-            lang = language or OS_LANGUAGE
-            # OpenSubtitles expects numeric IMDB ID (without "tt" prefix)
-            imdb_num = imdb_id.lstrip("t")
-            params = {"sublanguageid": lang, "imdbid": imdb_num}
-            if season is not None:
-                params["season"] = str(season)
-            if episode is not None:
-                params["episode"] = str(episode)
-            r = self.server.SearchSubtitles(self.token, [params])
-            if r.get("status", "").startswith("200"):
-                return r.get("data", []) or []
-        except Exception as e:
-            log.error(f"OS IMDB search error: {e}")
-        return []
+        lang = _to_iso2(language or OS_LANGUAGE)
+        imdb_num = str(imdb_id).lower().lstrip("t")
+        params = {"imdb_id": imdb_num, "languages": lang}
+        if season is not None:
+            params["season_number"] = int(season)
+        if episode is not None:
+            params["episode_number"] = int(episode)
+        return self._search(params)
 
     def search_name(self, query, season=None, episode=None, language=None):
-        try:
-            lang = language or OS_LANGUAGE
-            params = {"sublanguageid": lang, "query": query}
-            if season is not None:
-                params["season"] = str(season)
-            if episode is not None:
-                params["episode"] = str(episode)
-            r = self.server.SearchSubtitles(self.token, [params])
-            if r.get("status", "").startswith("200"):
-                return r.get("data", []) or []
-        except Exception as e:
-            log.error(f"OS name search error: {e}")
-        return []
+        lang = _to_iso2(language or OS_LANGUAGE)
+        params = {"query": query, "languages": lang}
+        if season is not None:
+            params["season_number"] = int(season)
+        if episode is not None:
+            params["episode_number"] = int(episode)
+        return self._search(params)
 
     def download(self, sub_id):
+        """Request a download link, then fetch the SRT bytes."""
+        if not sub_id:
+            return None
         try:
-            r = self.server.DownloadSubtitles(self.token, [str(sub_id)])
-            if r.get("status", "").startswith("200"):
-                data = r.get("data", [])
-                if data:
-                    return gzip.decompress(base64.b64decode(data[0]["data"]))
+            file_id = int(sub_id)
+        except (TypeError, ValueError):
+            log.warning(f"  OpenSubtitles download: invalid file_id '{sub_id}'")
+            return None
+        resp = self._request("POST", "/download", body={"file_id": file_id})
+        if not resp:
+            return None
+        link = resp.get("link")
+        if not link:
+            log.warning(f"  OpenSubtitles download: no link in response ({resp})")
+            return None
+        try:
+            with urllib.request.urlopen(link, timeout=30) as r:
+                return r.read()
         except Exception as e:
-            log.error(f"OS download error: {e}")
-        return None
+            log.warning(f"  OpenSubtitles download fetch failed: {e}")
+            return None
 
 
 # =============================================================================
@@ -1152,16 +1262,10 @@ def _cascade_search(client, video_path, language, file_hash=None, file_size=0):
     if file_hash:
         time.sleep(DELAY_BETWEEN_API_CALLS)
         try:
-            r = client.server.SearchSubtitles(client.token, [{
-                "sublanguageid": language,
-                "moviehash": file_hash,
-                "moviebytesize": str(file_size),
-            }])
-            if r.get("status", "").startswith("200"):
-                results = r.get("data", []) or []
-                log.info(f"  {lang_label} hash search: {len(results)} results")
-                if results:
-                    return results
+            results = client.search_hash(file_hash, file_size)
+            log.info(f"  {lang_label} hash search: {len(results)} results")
+            if results:
+                return results
         except Exception as e:
             log.error(f"  {lang_label} hash search error: {e}")
 
@@ -1186,7 +1290,7 @@ def _cascade_search(client, video_path, language, file_hash=None, file_size=0):
     return []
 
 
-def _download_first_valid(client, results, video_path, max_tries=5):
+def _download_first_valid(client, results, video_path, max_tries=15):
     """Try downloading subtitles from results in score order, skipping placeholders.
     Returns (content_bytes, sub_info) or (None, None)."""
     if not results:

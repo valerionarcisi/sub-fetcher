@@ -4,7 +4,8 @@ Automated Italian subtitle downloader with Telegram bot interface. Scans your me
 
 ## Features
 
-- **Multi-provider search**: Subdl.com (primary) + OpenSubtitles.org (fallback)
+- **Multi-provider search**: Subdl.com (primary) + OpenSubtitles.com REST v1 (fallback)
+- **TMDb lookup**: resolves IMDb ID from title + year when no `.nfo` file is present, so search runs on a canonical ID instead of a dirty filename
 - **Two-phase download**: EN subs downloaded for free, translation is optional and cost-estimated upfront
 - **AI translation**: English → Italian via Claude API with cost estimate before confirmation
 - **Audio sync**: ffsubsync aligns subtitles to video audio (handles different releases)
@@ -43,8 +44,9 @@ Phase 2 (PAID, user confirms):
 
 - **Telegram Bot**: Create via [@BotFather](https://t.me/BotFather)
 - **Subdl.com**: Register at [subdl.com](https://subdl.com) for a free API key
+- **OpenSubtitles.com** (recommended): Register at [opensubtitles.com](https://www.opensubtitles.com), then create an API consumer at `/en/consumers` with `dev_mode` enabled (100 downloads/day free). Copy the API key.
+- **TMDb** (recommended): Register at [themoviedb.org](https://www.themoviedb.org/settings/api), request a Developer key (free, unlimited). Used to resolve IMDb IDs from title + year.
 - **Claude API** (optional): Get from [console.anthropic.com](https://console.anthropic.com)
-- **OpenSubtitles** (optional): Register at [opensubtitles.org](https://www.opensubtitles.org)
 
 ### 2. Docker Compose
 
@@ -65,9 +67,9 @@ sub-fetcher:
     - TELEGRAM_BOT_TOKEN=your_token
     - TELEGRAM_CHAT_ID=your_chat_id
     - SUBDL_API_KEY=your_subdl_key
-    - CLAUDE_API_KEY=your_claude_key        # optional
-    - OS_USERNAME=your_os_username           # optional
-    - OS_PASSWORD=your_os_password           # optional
+    - OPENSUBTITLES_API_KEY=your_opensubtitles_consumer_key   # recommended
+    - TMDB_API_KEY=your_tmdb_v3_api_key                       # recommended
+    - CLAUDE_API_KEY=your_claude_key                          # optional
 ```
 
 ### 3. Run
@@ -96,10 +98,12 @@ Type any text to search your media library (handles dots in filenames).
 For each video, the bot tries multiple strategies in order:
 
 1. **Local files**: Check if `.it.srt` or `.en.srt` already exists in the folder
-2. **Subdl.com ITA**: Search by IMDB ID (from `.nfo` files) or by name, with episode matching
-3. **OpenSubtitles ITA**: Search by file hash, IMDB ID, or name (tries up to 5 results, skipping VIP placeholders)
-4. **Subdl.com ENG**: Save `.en.srt`, sync to audio, ask user to translate
-5. **OpenSubtitles ENG**: Same as above
+2. **Filename parsing**: Strips scraper/tracker prefixes (`www.SceneTime.com -`, `[YTS.MX]`) and handles year in parentheses (`Film (2002).mkv`)
+3. **IMDb ID resolution**: Reads `.nfo` files written by Radarr/Sonarr; falls back to TMDb lookup by title + year
+4. **Subdl.com ITA**: Search by IMDb ID (most reliable) or by name, with episode matching
+5. **OpenSubtitles.com ITA** (REST v1): Search by file hash → IMDb ID → name, tries up to 15 results skipping VIP placeholders
+6. **Subdl.com ENG**: Save `.en.srt`, sync to audio, ask user to translate
+7. **OpenSubtitles.com ENG**: Same as above
 
 ## Architecture
 
@@ -111,7 +115,8 @@ Single Python file (`sub_fetcher.py`), no frameworks. Runs as a long-lived proce
 | Subtitle sync | ffsubsync (Voice Activity Detection) |
 | Audio detection | ffprobe (Italian audio track detection) |
 | Primary provider | Subdl.com REST API |
-| Fallback provider | OpenSubtitles.org XML-RPC |
+| Fallback provider | OpenSubtitles.com REST API v1 |
+| IMDb ID resolution | `.nfo` files → TMDb search fallback |
 | Translation | Claude API (batches of 100 subtitle blocks) |
 | Bot interface | Telegram Bot API (polling) |
 | State | JSON file (`/config/state.json`) |
@@ -131,7 +136,13 @@ AGENTS.md                # Agent/AI coding guidelines
 
 ### Run tests
 ```bash
-python3 test_sub_fetcher.py -v
+python3 -m unittest test_sub_fetcher -v
+```
+
+### Pre-commit hook
+A tracked hook in `.githooks/pre-commit` runs the full test suite before every commit. Activate it once after cloning:
+```bash
+git config core.hooksPath .githooks
 ```
 
 ### Rebuild and restart

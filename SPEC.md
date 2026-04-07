@@ -80,12 +80,19 @@ VIDEO FILE DISCOVERED
 - **Rate limits**: Per API key
 - **Episode matching**: Scoring system ensures correct episode is selected (+500 match, -1000 mismatch)
 
-### OpenSubtitles.org (Fallback)
-- **API**: XML-RPC `https://api.opensubtitles.org/xml-rpc`
-- **Auth**: Username/password (optional, anonymous works with lower limits)
-- **Search**: by file hash, IMDB ID, name + season/episode
-- **Download**: gzip+base64 encoded via XML-RPC
-- **Issue**: Free users get VIP placeholder subtitles (fake ads). Bot tries up to 5 results to find a real one.
+### OpenSubtitles.com REST API v1 (Fallback)
+- **API**: REST JSON `https://api.opensubtitles.com/api/v1`
+- **Auth**: API key via `Api-Key` header, obtained by registering a consumer at `/en/consumers`. Enable `dev_mode` for 100 downloads/day free.
+- **Search**: `GET /subtitles` with any of `moviehash`, `imdb_id`, `query`, plus `season_number`, `episode_number`, `languages` (ISO-639-1 two-letter codes).
+- **Download**: `POST /download {file_id}` returns a one-time signed URL; fetch the URL to get raw SRT bytes.
+- **Advantage over legacy XML-RPC**: the REST API does NOT return VIP placeholder ads. This alone eliminates the main source of download failures.
+- `OSClient._to_legacy` maps REST response items to the old XML-RPC field names (`SubFileName`, `MovieReleaseName`, `IDSubtitleFile`, `SubFormat`, `SubDownloadsCnt`, `SubRating`, `MatchedBy`) so downstream scoring code (`pick_best`, `_download_first_valid`) is untouched.
+
+### TMDb (IMDb ID resolver)
+- **API**: `https://api.themoviedb.org/3` (v3 key, passed as `api_key` query param).
+- **Flow**: `tmdb_find_imdb_id(title, year, is_tv)` calls `/search/movie` (or `/search/tv`) to get a TMDb ID, then `/movie/{id}/external_ids` to extract the IMDb ID.
+- **Used by**: `find_imdb_id`, as a fallback when no `.nfo` file provides an IMDb ID. Turns a dirty filename into a canonical `ttXXXXXXX` so both Subdl and OpenSubtitles can search reliably.
+- **No-op if `TMDB_API_KEY` is empty** — the resolver returns `None` and callers degrade to name-based search.
 
 ## Key Components
 
@@ -138,7 +145,11 @@ Extracts `{type, name, year|season+episode}` from the basename:
 5. **Title normalization** (`_clean_title`) — converts dots/underscores to spaces but preserves internal hyphens (so `Punch-Drunk` is not split).
 
 ### IMDB ID Discovery (`find_imdb_id`)
-Searches `.nfo` files (Sonarr/Radarr) in the video's directory and parent directory. Extracts IMDB ID via regex `tt\d{7,}`. Used by both Subdl and OpenSubtitles for more accurate search.
+Two-step resolver:
+1. **`_find_imdb_id_from_nfo`** — reads `.nfo` files (Sonarr/Radarr) in the video's directory and parent directory, extracts IMDb ID via regex `tt\d{7,}`.
+2. **`tmdb_find_imdb_id`** (fallback) — if no `.nfo` is found, uses `parse_video` to get cleaned title + year, queries TMDb, and returns the IMDb ID.
+
+Used by both Subdl and OpenSubtitles for accurate search. Having an IMDb ID routes around messy filenames entirely.
 
 ### Search Query Generation (`get_search_queries`)
 Returns a deduplicated list of search terms:
@@ -195,10 +206,12 @@ Type any text in Telegram to search. Handles dots/underscores in filenames (e.g.
 | `TELEGRAM_BOT_TOKEN` | Yes | Telegram bot API token |
 | `TELEGRAM_CHAT_ID` | Yes | Target chat ID |
 | `SUBDL_API_KEY` | Yes | Subdl.com API key (free) |
+| `OPENSUBTITLES_API_KEY` | Recommended | OpenSubtitles.com REST v1 API consumer key (free, enable `dev_mode` for 100 dl/day) |
+| `TMDB_API_KEY` | Recommended | TMDb v3 API key (free, unlimited). Enables IMDb ID resolution from title+year |
 | `CLAUDE_API_KEY` | No | Enables EN→IT translation fallback |
 | `CLAUDE_MODEL` | No | Default: `claude-sonnet-4-20250514` |
-| `OS_USERNAME` | No | OpenSubtitles.org username |
-| `OS_PASSWORD` | No | OpenSubtitles.org password |
+| `OS_USERNAME` | No | Legacy, unused (kept for backwards compat) |
+| `OS_PASSWORD` | No | Legacy, unused (kept for backwards compat) |
 
 ## Dependencies
 | Dependency | Purpose | Install |

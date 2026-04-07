@@ -11,6 +11,7 @@ import importlib
 import io
 import zipfile
 import urllib.request
+import json
 
 # Setup: create a temp /config-like directory and patch the module
 # before it gets imported, to avoid FileNotFoundError on /config
@@ -314,24 +315,102 @@ class TestPlaceholderDetection(unittest.TestCase):
         self.assertTrue(sub_fetcher.is_placeholder_sub(content))
 
 
+class TestOSClientRestMapping(unittest.TestCase):
+    """Verify the REST v1 -> legacy field mapping in OSClient._to_legacy."""
+
+    def test_maps_basic_fields(self):
+        item = {
+            "attributes": {
+                "release": "Punch-Drunk.Love.2002.1080p.BluRay.x264-DEPTH",
+                "download_count": 1234,
+                "ratings": 8.5,
+                "moviehash_match": False,
+                "files": [{"file_id": 987, "file_name": "Punch-Drunk.Love.srt"}],
+            }
+        }
+        legacy = sub_fetcher.OSClient._to_legacy(item)
+        self.assertEqual(legacy["SubFileName"], "Punch-Drunk.Love.srt")
+        self.assertEqual(legacy["MovieReleaseName"], "Punch-Drunk.Love.2002.1080p.BluRay.x264-DEPTH")
+        self.assertEqual(legacy["IDSubtitleFile"], "987")
+        self.assertEqual(legacy["SubFormat"], "srt")
+        self.assertEqual(legacy["SubDownloadsCnt"], 1234)
+        self.assertEqual(legacy["SubRating"], 8.5)
+        self.assertEqual(legacy["MatchedBy"], "")
+
+    def test_marks_hash_matches(self):
+        item = {"attributes": {"moviehash_match": True, "files": [{"file_id": 1, "file_name": "x.srt"}]}}
+        legacy = sub_fetcher.OSClient._to_legacy(item)
+        self.assertEqual(legacy["MatchedBy"], "moviehash")
+
+    def test_handles_empty_files(self):
+        item = {"attributes": {"release": "Foo", "files": []}}
+        legacy = sub_fetcher.OSClient._to_legacy(item)
+        self.assertEqual(legacy["SubFileName"], "Foo")
+        self.assertEqual(legacy["IDSubtitleFile"], "")
+
+    def test_handles_missing_attributes(self):
+        legacy = sub_fetcher.OSClient._to_legacy({})
+        self.assertEqual(legacy["SubFileName"], "")
+        self.assertEqual(legacy["SubDownloadsCnt"], 0)
+
+
+class TestTmdbLookup(unittest.TestCase):
+    def test_returns_none_without_api_key(self):
+        original = sub_fetcher.TMDB_API_KEY
+        sub_fetcher.TMDB_API_KEY = ""
+        try:
+            self.assertIsNone(sub_fetcher.tmdb_find_imdb_id("Whatever", 2020))
+        finally:
+            sub_fetcher.TMDB_API_KEY = original
+
+    def test_resolves_imdb_id_via_two_calls(self):
+        from unittest.mock import patch, MagicMock
+        original = sub_fetcher.TMDB_API_KEY
+        sub_fetcher.TMDB_API_KEY = "fake"
+
+        search_resp = MagicMock()
+        search_resp.read.return_value = json.dumps({"results": [{"id": 42}]}).encode()
+        search_resp.__enter__ = lambda s: s
+        search_resp.__exit__ = lambda *a: None
+
+        ext_resp = MagicMock()
+        ext_resp.read.return_value = json.dumps({"imdb_id": "tt0272338"}).encode()
+        ext_resp.__enter__ = lambda s: s
+        ext_resp.__exit__ = lambda *a: None
+
+        try:
+            with patch("urllib.request.urlopen", side_effect=[search_resp, ext_resp]):
+                result = sub_fetcher.tmdb_find_imdb_id("Punch-Drunk Love", 2002)
+            self.assertEqual(result, "tt0272338")
+        finally:
+            sub_fetcher.TMDB_API_KEY = original
+
+    def test_returns_none_on_empty_search(self):
+        from unittest.mock import patch, MagicMock
+        original = sub_fetcher.TMDB_API_KEY
+        sub_fetcher.TMDB_API_KEY = "fake"
+        empty_resp = MagicMock()
+        empty_resp.read.return_value = json.dumps({"results": []}).encode()
+        empty_resp.__enter__ = lambda s: empty_resp
+        empty_resp.__exit__ = lambda *a: None
+        try:
+            with patch("urllib.request.urlopen", return_value=empty_resp):
+                self.assertIsNone(sub_fetcher.tmdb_find_imdb_id("NonExistentMovie", 1900))
+        finally:
+            sub_fetcher.TMDB_API_KEY = original
+
+
 class TestCascadeSearchUnit(unittest.TestCase):
     """Test _cascade_search logic with mocked OSClient."""
 
     def test_returns_hash_results_first(self):
         class MockClient:
             token = "fake"
-            server = None
+            def search_hash(self, file_hash, file_size):
+                return [{"SubFileName": "hash_result.srt"}]
             def search_imdb(self, *a, **kw): return []
             def search_name(self, *a, **kw): return []
-
         client = MockClient()
-        # Mock the server.SearchSubtitles for hash search
-        class MockServer:
-            def SearchSubtitles(self, token, params):
-                if "moviehash" in params[0]:
-                    return {"status": "200 OK", "data": [{"SubFileName": "hash_result.srt"}]}
-                return {"status": "200 OK", "data": []}
-        client.server = MockServer()
 
         results = sub_fetcher._cascade_search(
             client, "/media/series/Test/Test.S01E01.mkv", "ita",
@@ -343,15 +422,12 @@ class TestCascadeSearchUnit(unittest.TestCase):
     def test_falls_through_to_name_search(self):
         class MockClient:
             token = "fake"
+            def search_hash(self, *a, **kw): return []
             def search_imdb(self, *a, **kw): return []
             def search_name(self, query, season=None, episode=None, language=None):
                 if query == "Test":
                     return [{"SubFileName": "name_result.srt"}]
                 return []
-            class server:
-                @staticmethod
-                def SearchSubtitles(token, params):
-                    return {"status": "200 OK", "data": []}
         client = MockClient()
 
         results = sub_fetcher._cascade_search(
