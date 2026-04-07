@@ -44,7 +44,7 @@ TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 # Get an API key at https://www.opensubtitles.com/en/consumers
 OPENSUBTITLES_API_KEY = os.environ.get("OPENSUBTITLES_API_KEY", "")
 OPENSUBTITLES_API_URL = "https://api.opensubtitles.com/api/v1"
-OPENSUBTITLES_USER_AGENT = "subfetcher v1.0"
+OPENSUBTITLES_USER_AGENT = "NarcisiSubs v1.0.0"
 # Legacy XML-RPC credentials kept for backwards compatibility only — unused now.
 OS_USERNAME = os.environ.get("OS_USERNAME", "")
 OS_PASSWORD = os.environ.get("OS_PASSWORD", "")
