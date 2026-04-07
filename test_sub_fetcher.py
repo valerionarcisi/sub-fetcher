@@ -244,6 +244,31 @@ class TestParseVideo(unittest.TestCase):
         self.assertEqual(result["name"], "Loro")
         self.assertNotEqual(result["name"], "films")
 
+    def test_movie_year_in_parentheses(self):
+        result = sub_fetcher.parse_video("/media/films/Punch-Drunk Love (2002).mkv")
+        self.assertEqual(result["type"], "movie")
+        self.assertEqual(result["name"], "Punch-Drunk Love")
+        self.assertEqual(result["year"], 2002)
+
+    def test_movie_strips_scraper_prefix(self):
+        result = sub_fetcher.parse_video("/media/films/www.SceneTime.com - Punch-Drunk Love (2002).mkv")
+        self.assertEqual(result["type"], "movie")
+        self.assertEqual(result["name"], "Punch-Drunk Love")
+        self.assertEqual(result["year"], 2002)
+
+    def test_movie_strips_bracket_tracker_tag(self):
+        result = sub_fetcher.parse_video("/media/films/[YTS.MX] Gummo (1997).mkv")
+        self.assertEqual(result["type"], "movie")
+        self.assertEqual(result["name"], "Gummo")
+        self.assertEqual(result["year"], 1997)
+
+    def test_episode_strips_scraper_prefix(self):
+        result = sub_fetcher.parse_video("/media/series/www.SceneTime.com - Pluribus.S01E05.720p.mkv")
+        self.assertEqual(result["type"], "episode")
+        self.assertEqual(result["name"], "Pluribus")
+        self.assertEqual(result["season"], 1)
+        self.assertEqual(result["episode"], 5)
+
     def test_unknown_cleans_junk_tags(self):
         result = sub_fetcher.parse_video("/media/films/SomeMovie/SomeMovie.720p.BluRay.x264.mp4")
         self.assertEqual(result["type"], "unknown")

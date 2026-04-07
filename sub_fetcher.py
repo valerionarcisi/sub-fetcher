@@ -261,20 +261,42 @@ def compute_hash(filepath):
 # FILENAME PARSING
 # =============================================================================
 
+_SCRAPER_PREFIX_RE = re.compile(
+    r"^\s*(?:www[.\s_-]*)?[\w-]+\.(?:com|org|net|it|to|me|info|io)\s*[-_.\s]+",
+    re.IGNORECASE,
+)
+_BRACKET_PREFIX_RE = re.compile(r"^\s*[\[\(][^\]\)]+[\]\)]\s*[-_.\s]*")
+
+
+def _strip_scraper_noise(s):
+    prev = None
+    while prev != s:
+        prev = s
+        s = _SCRAPER_PREFIX_RE.sub("", s)
+        s = _BRACKET_PREFIX_RE.sub("", s)
+    return s
+
+
+def _clean_title(s):
+    s = s.replace(".", " ").replace("_", " ")
+    s = re.sub(r"\s{2,}", " ", s)
+    return s.strip(" -")
+
+
 def parse_video(filepath):
     fname = os.path.basename(filepath)
     name_no_ext = os.path.splitext(fname)[0]
+    name_no_ext = _strip_scraper_noise(name_no_ext)
 
     # Series: S01E01
     m = re.search(r"(.+?)[.\s_-]+[Ss](\d{1,2})[Ee](\d{1,2})", name_no_ext)
     if m:
-        show = m.group(1).replace(".", " ").replace("_", " ").strip()
-        return {"type": "episode", "name": show, "season": int(m.group(2)), "episode": int(m.group(3))}
+        return {"type": "episode", "name": _clean_title(m.group(1)), "season": int(m.group(2)), "episode": int(m.group(3))}
 
-    # Movie: Name.Year
-    m = re.search(r"(.+?)[.\s_-]+(\d{4})[.\s_-]", name_no_ext)
+    # Movie: Name Year  or  Name (Year)
+    m = re.search(r"(.+?)[.\s_\-]*\(?(\d{4})\)?(?:[.\s_\-)\]]|$)", name_no_ext)
     if m:
-        return {"type": "movie", "name": m.group(1).replace(".", " ").replace("_", " ").strip(), "year": int(m.group(2))}
+        return {"type": "movie", "name": _clean_title(m.group(1)), "year": int(m.group(2))}
 
     # Fallback: use filename without extension, cleaned up
     # Avoid using media root folders like "films" or "series" as name
