@@ -129,6 +129,14 @@ When searching for series episodes, the scoring system ensures the correct episo
 - **Wrong episode** (e.g. S01E08 sub for S01E01 video): **-1000 points**
 - This prevents downloading a random episode's subtitles
 
+### Filename Parsing (`parse_video`)
+Extracts `{type, name, year|season+episode}` from the basename:
+1. **Scraper noise stripping** (`_strip_scraper_noise`) — removes leading tracker/scraper prefixes via two regexes applied in a loop: domain-like prefixes (`www.SceneTime.com -`, `rarbg.to.`) and bracketed tags (`[YTS.MX]`, `(RARBG)`). Loops until stable to handle chained prefixes.
+2. **Series regex** — `(.+?)[.\s_-]+[Ss]\d+[Ee]\d+` for `SxxEyy` patterns.
+3. **Movie regex** — `(.+?)[.\s_-]*\(?(\d{4})\)?(?:[.\s_\-)\]]|$)` supports year with or without parentheses, with or without trailing separator. Crucial for files like `Title (2002).mkv` where `)` is not a separator.
+4. **Fallback** — strips common quality/codec tags (`720p`, `x264`, `bluray`, etc.) and returns `type: "unknown"`.
+5. **Title normalization** (`_clean_title`) — converts dots/underscores to spaces but preserves internal hyphens (so `Punch-Drunk` is not split).
+
 ### IMDB ID Discovery (`find_imdb_id`)
 Searches `.nfo` files (Sonarr/Radarr) in the video's directory and parent directory. Extracts IMDB ID via regex `tt\d{7,}`. Used by both Subdl and OpenSubtitles for more accurate search.
 
@@ -223,4 +231,38 @@ The main loop and the queue worker run in separate threads and both read/write p
 - The previous bug: batches were stored inside `state["batches"]`. The main thread's unconditional `save_state()` call at the end of `process_callbacks` used a stale in-memory state without the queue worker's newly-added batches, silently wiping them. Moving batches to a separate file eliminates this entirely.
 
 ## Testing
-Run: `python3 test_sub_fetcher.py -v`
+Run: `python3 -m unittest test_sub_fetcher -v`
+
+### Pre-commit hook
+The repo ships a tracked hook at `.githooks/pre-commit` that runs the full test suite before every commit. On first clone, activate it once:
+```sh
+git config core.hooksPath .githooks
+```
+
+## Future Ideas
+
+Non-committed brainstorm of features that would be easy to add on top of the current architecture. Pick whichever becomes painful first.
+
+### TMDb fallback lookup
+When all providers return zero results, query TMDb by cleaned title + year to obtain the canonical title and IMDb ID, then retry the search by IMDb ID. Would rescue cases where the filename contains typos, alternate titles, or localized names. Requires a free TMDb API key.
+
+### `/retitle <video> <new title>` command
+Allow the user to manually override the parsed title for a specific file from Telegram. The override is stored in `state.json` and reused on next search. Useful when `parse_video` misfires on edge cases (anime with fansub tags, documentaries with unusual naming).
+
+### Provider success-rate stats
+Track per-provider hits/misses in `state.json` and expose via `/stats`. Helps decide when to reorder the provider cascade or drop one.
+
+### Notification when a previously-failed item is finally found
+Failures are retried after 24h. Today the user only sees the retry if they open Telegram at the right moment. A one-shot "📬 Finalmente trovato: X" notification on success would close the loop.
+
+### Multi-language support
+Currently hardcoded to Italian. Generalizing to a `TARGET_LANGS` env var (e.g. `it,es`) would let the same bot serve mixed-language households. Scoring, regex, and Claude translation prompt already parameterize cleanly on language code.
+
+### inotify / watchdog instead of polling
+Main loop scans the filesystem on a timer. Switching to `watchdog` would cut idle CPU and make new releases appear on Telegram within seconds instead of minutes. Keep the periodic scan as a safety net for missed events.
+
+### `/undo` last download
+Keep the last N downloaded subtitle paths in a ring buffer. `/undo` deletes the most recent `.it.srt` and re-marks the video as pending. Useful when a wrong subtitle slipped through the placeholder detector.
+
+### Subtitle quality score in notifications
+When multiple candidates exist, show the chosen one's score and provider in the success message (e.g. `✅ Punch-Drunk Love — Subdl (score: 780)`). Makes it easier to spot low-confidence matches that may need `/sync` or manual review.
