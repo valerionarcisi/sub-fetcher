@@ -424,6 +424,20 @@ def detect_language_from_srt(srt_path, sample_size=2000):
     return "unknown"
 
 
+EN_SUB_SUFFIXES = [".en.srt", ".eng.srt", ".english.srt"]
+
+
+def find_english_sub(video_path):
+    """Return the path of an existing English subtitle for this video, or None.
+    Checks common suffixes in order: .en.srt, .eng.srt, .english.srt."""
+    base = os.path.splitext(video_path)[0]
+    for suffix in EN_SUB_SUFFIXES:
+        path = base + suffix
+        if os.path.exists(path):
+            return path
+    return None
+
+
 def find_existing_srt(video_path):
     """Check for existing subtitle files in the video's directory."""
     base = os.path.splitext(video_path)[0]
@@ -431,10 +445,9 @@ def find_existing_srt(video_path):
     video_base_name = os.path.splitext(os.path.basename(video_path))[0].lower()
 
     # Check for English subtitles
-    for suffix in [".en.srt", ".eng.srt", ".english.srt"]:
-        path = base + suffix
-        if os.path.exists(path):
-            return {"lang": "en", "path": path}
+    en_path = find_english_sub(video_path)
+    if en_path:
+        return {"lang": "en", "path": en_path}
 
     # Check for generic .srt matching the video name
     generic_srt = base + ".srt"
@@ -2305,8 +2318,8 @@ def do_translate_prep(query, state, progress_msg_id=None):
         if has_italian_sub(video_path):
             already_it.append(video_path)
             continue
-        en_srt = os.path.splitext(video_path)[0] + ".en.srt"
-        if not os.path.exists(en_srt):
+        en_srt = find_english_sub(video_path)
+        if not en_srt:
             no_en.append(video_path)
             continue
         eligible.append((video_path, en_srt))
@@ -2365,20 +2378,22 @@ def do_translate_prep(query, state, progress_msg_id=None):
 
 
 def _estimate_batch_translation_cost(paths):
-    """Estimate total translation cost for a list of video paths with .en.srt files."""
+    """Estimate total translation cost for a list of video paths with English sub files.
+    Accepts .en.srt, .eng.srt, .english.srt."""
     total_cost = 0.0
     total_blocks = 0
     for video_path in paths:
-        en_srt = os.path.splitext(video_path)[0] + ".en.srt"
-        if os.path.exists(en_srt):
-            try:
-                with open(en_srt, "r", encoding="utf-8", errors="ignore") as f:
-                    content = f.read()
-                cost, blocks = estimate_translation_cost(content)
-                total_cost += cost
-                total_blocks += blocks
-            except Exception:
-                pass
+        en_srt = find_english_sub(video_path)
+        if not en_srt:
+            continue
+        try:
+            with open(en_srt, "r", encoding="utf-8", errors="ignore") as f:
+                content = f.read()
+            cost, blocks = estimate_translation_cost(content)
+            total_cost += cost
+            total_blocks += blocks
+        except Exception:
+            pass
     return total_cost, total_blocks
 
 
@@ -2396,8 +2411,8 @@ def do_batch_translate(paths, state, progress_msg_id=None):
             success_names.append(friendly_name(video_path))
             continue
 
-        en_srt = os.path.splitext(video_path)[0] + ".en.srt"
-        if not os.path.exists(en_srt):
+        en_srt = find_english_sub(video_path)
+        if not en_srt:
             failed += 1
             failed_names.append(friendly_name(video_path))
             continue
@@ -2500,9 +2515,9 @@ def _queue_worker(state_ref):
                 if result is True and msg_id:
                     tg_edit_message(msg_id, f"✅ Sub ITA scaricato per:\n<b>{name}</b>")
                 elif result == "en_only" and msg_id:
-                    en_srt = os.path.splitext(video_path)[0] + ".en.srt"
+                    en_srt = find_english_sub(video_path)
                     cost, blocks = (0, 0)
-                    if os.path.exists(en_srt):
+                    if en_srt:
                         with open(en_srt, "r", encoding="utf-8", errors="ignore") as f:
                             cost, blocks = estimate_translation_cost(f.read())
                     tr_hash = str(abs(hash(video_path)))[:8]

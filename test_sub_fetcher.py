@@ -400,6 +400,63 @@ class TestTmdbLookup(unittest.TestCase):
             sub_fetcher.TMDB_API_KEY = original
 
 
+class TestFindEnglishSub(unittest.TestCase):
+    def test_finds_en_srt(self):
+        tmp = tempfile.mkdtemp()
+        try:
+            video = os.path.join(tmp, "film.mkv")
+            en = os.path.join(tmp, "film.en.srt")
+            open(video, "w").close()
+            open(en, "w").close()
+            self.assertEqual(sub_fetcher.find_english_sub(video), en)
+        finally:
+            shutil.rmtree(tmp)
+
+    def test_finds_eng_srt(self):
+        tmp = tempfile.mkdtemp()
+        try:
+            video = os.path.join(tmp, "film.mkv")
+            eng = os.path.join(tmp, "film.eng.srt")
+            open(video, "w").close()
+            open(eng, "w").close()
+            self.assertEqual(sub_fetcher.find_english_sub(video), eng)
+        finally:
+            shutil.rmtree(tmp)
+
+    def test_finds_english_srt(self):
+        tmp = tempfile.mkdtemp()
+        try:
+            video = os.path.join(tmp, "film.mkv")
+            english = os.path.join(tmp, "film.english.srt")
+            open(video, "w").close()
+            open(english, "w").close()
+            self.assertEqual(sub_fetcher.find_english_sub(video), english)
+        finally:
+            shutil.rmtree(tmp)
+
+    def test_returns_none_when_no_en_sub(self):
+        tmp = tempfile.mkdtemp()
+        try:
+            video = os.path.join(tmp, "film.mkv")
+            open(video, "w").close()
+            self.assertIsNone(sub_fetcher.find_english_sub(video))
+        finally:
+            shutil.rmtree(tmp)
+
+    def test_prefers_en_over_eng_over_english(self):
+        tmp = tempfile.mkdtemp()
+        try:
+            video = os.path.join(tmp, "film.mkv")
+            en = os.path.join(tmp, "film.en.srt")
+            eng = os.path.join(tmp, "film.eng.srt")
+            open(video, "w").close()
+            open(en, "w").close()
+            open(eng, "w").close()
+            self.assertEqual(sub_fetcher.find_english_sub(video), en)
+        finally:
+            shutil.rmtree(tmp)
+
+
 class TestTranslatePrep(unittest.TestCase):
     """do_translate_prep: sync .en.srt for matches then ask the user to translate."""
 
@@ -433,6 +490,31 @@ class TestTranslatePrep(unittest.TestCase):
                  patch.object(sub_fetcher, "tg_send", side_effect=lambda *a, **k: sent.append(a)):
                 sub_fetcher.do_translate_prep("film", state={}, progress_msg_id=None)
             self.assertTrue(any("Senza .en.srt" in str(a) for a in sent))
+        finally:
+            shutil.rmtree(tmp)
+
+    def test_accepts_eng_srt_suffix(self):
+        from unittest.mock import patch, MagicMock
+        tmp = tempfile.mkdtemp()
+        try:
+            video = os.path.join(tmp, "film.mkv")
+            eng = os.path.join(tmp, "film.eng.srt")
+            open(video, "w").close()
+            with open(eng, "w") as f:
+                f.write("1\n00:00:01,000 --> 00:00:02,000\nHi\n")
+            sync_mock = MagicMock(return_value={"ok": True})
+            sent = []
+            batches_store = {}
+            with patch.object(sub_fetcher, "find_videos_by_name", return_value=[video]), \
+                 patch.object(sub_fetcher, "has_italian_sub", return_value=False), \
+                 patch.object(sub_fetcher, "sync_subtitle", sync_mock), \
+                 patch.object(sub_fetcher, "_estimate_batch_translation_cost", return_value=(0.05, 5)), \
+                 patch.object(sub_fetcher, "load_batches", return_value=batches_store), \
+                 patch.object(sub_fetcher, "save_batches", side_effect=lambda b: batches_store.update(b)), \
+                 patch.object(sub_fetcher, "tg_send", side_effect=lambda *a, **k: sent.append((a, k)) or {"ok": True, "result": {"message_id": 1}}):
+                sub_fetcher.do_translate_prep("film", state={}, progress_msg_id=None)
+            sync_mock.assert_called_once_with(video, eng)
+            self.assertTrue(any("batch_translate" in str(s) for s in sent))
         finally:
             shutil.rmtree(tmp)
 
