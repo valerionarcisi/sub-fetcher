@@ -400,6 +400,65 @@ class TestTmdbLookup(unittest.TestCase):
             sub_fetcher.TMDB_API_KEY = original
 
 
+class TestTranslatePrep(unittest.TestCase):
+    """do_translate_prep: sync .en.srt for matches then ask the user to translate."""
+
+    def _mk_video_with_en(self, tmp, name):
+        video = os.path.join(tmp, f"{name}.mkv")
+        en = os.path.join(tmp, f"{name}.en.srt")
+        open(video, "w").close()
+        with open(en, "w") as f:
+            f.write("1\n00:00:01,000 --> 00:00:02,000\nHello\n")
+        return video, en
+
+    def test_no_matches_reports_and_exits(self):
+        from unittest.mock import patch
+        sent = []
+        with patch.object(sub_fetcher, "find_videos_by_name", return_value=[]), \
+             patch.object(sub_fetcher, "tg_send", side_effect=lambda *a, **k: sent.append(("send", a, k))), \
+             patch.object(sub_fetcher, "tg_edit_message", side_effect=lambda *a, **k: sent.append(("edit", a, k))):
+            sub_fetcher.do_translate_prep("Nothing", state={}, progress_msg_id=None)
+        self.assertTrue(sent)
+        self.assertIn("Nessun video", str(sent))
+
+    def test_no_eligible_videos_reports_skipped(self):
+        from unittest.mock import patch
+        tmp = tempfile.mkdtemp()
+        try:
+            video = os.path.join(tmp, "film.mkv")
+            open(video, "w").close()
+            sent = []
+            with patch.object(sub_fetcher, "find_videos_by_name", return_value=[video]), \
+                 patch.object(sub_fetcher, "has_italian_sub", return_value=False), \
+                 patch.object(sub_fetcher, "tg_send", side_effect=lambda *a, **k: sent.append(a)):
+                sub_fetcher.do_translate_prep("film", state={}, progress_msg_id=None)
+            self.assertTrue(any("Senza .en.srt" in str(a) for a in sent))
+        finally:
+            shutil.rmtree(tmp)
+
+    def test_eligible_video_gets_synced_and_offered(self):
+        from unittest.mock import patch, MagicMock
+        tmp = tempfile.mkdtemp()
+        try:
+            video, en = self._mk_video_with_en(tmp, "film")
+            sync_mock = MagicMock(return_value={"ok": True})
+            sent = []
+            batches_store = {}
+            with patch.object(sub_fetcher, "find_videos_by_name", return_value=[video]), \
+                 patch.object(sub_fetcher, "has_italian_sub", return_value=False), \
+                 patch.object(sub_fetcher, "sync_subtitle", sync_mock), \
+                 patch.object(sub_fetcher, "_estimate_batch_translation_cost", return_value=(0.12, 10)), \
+                 patch.object(sub_fetcher, "load_batches", return_value=batches_store), \
+                 patch.object(sub_fetcher, "save_batches", side_effect=lambda b: batches_store.update(b)), \
+                 patch.object(sub_fetcher, "tg_send", side_effect=lambda *a, **k: sent.append((a, k)) or {"ok": True, "result": {"message_id": 1}}):
+                sub_fetcher.do_translate_prep("film", state={}, progress_msg_id=None)
+            sync_mock.assert_called_once_with(video, en)
+            self.assertTrue(any("batch_translate" in str(s) for s in sent))
+            self.assertTrue(any("0.12" in str(s) for s in sent))
+        finally:
+            shutil.rmtree(tmp)
+
+
 class TestCascadeSearchUnit(unittest.TestCase):
     """Test _cascade_search logic with mocked OSClient."""
 

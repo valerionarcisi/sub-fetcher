@@ -197,6 +197,7 @@ Type any text in Telegram to search. Handles dots/underscores in filenames (e.g.
 | `/reset` | Clear state cache |
 | `/help` | Help |
 | `/sync [name]` | Sync all/matching .it.srt to video audio |
+| `/translate <name>` | For videos matching `<name>` with a `.en.srt` but no `.it.srt`, sync each EN sub to audio and then ask the user to confirm the EN→IT translation (Claude). Reuses the batch translate flow. |
 | `/sub <name>` | Manual search by title |
 | `<text>` | Search for videos matching text |
 

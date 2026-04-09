@@ -1879,6 +1879,7 @@ def process_callbacks(state, excludes):
                     f"/scan — Forza scansione\n"
                     f"/costs — Costi traduzioni Claude\n"
                     f"/sync — Riallinea tutti i sub ITA ai video\n"
+                    f"/translate &lt;nome&gt; — Sync .en.srt e chiedi se tradurre\n"
                     f"/cleanup — Trova e rimuovi sub placeholder/VIP\n"
                     f"/excludes — Lista cartelle escluse\n"
                     f"/reset — Resetta cache (riparte da zero)\n"
@@ -1913,6 +1914,22 @@ def process_callbacks(state, excludes):
                     )
                     msg_id = result["result"]["message_id"] if result and result.get("ok") else None
                     download_queue.put({"type": "sync", "query": query, "msg_id": msg_id})
+
+            elif text.startswith("/translate"):
+                query = text[len("/translate"):].strip()
+                if not query:
+                    tg_send(
+                        "Usa: <code>/translate nome film o serie</code>\n"
+                        "Sincronizza i .en.srt trovati all'audio e poi chiede se tradurre in italiano."
+                    )
+                else:
+                    pos = queue_position()
+                    result = tg_send(
+                        f"🔄 Translate prep <b>{query}</b> in coda..."
+                        + (f"\n⏳ Posizione {pos + 1}" if pos > 0 else "")
+                    )
+                    msg_id = result["result"]["message_id"] if result and result.get("ok") else None
+                    download_queue.put({"type": "translate_prep", "query": query, "msg_id": msg_id})
 
             elif text == "/cleanup":
                 pos = queue_position()
@@ -2262,6 +2279,91 @@ def do_batch_download(paths, state, progress_msg_id=None):
             tg_send(summary)
 
 
+def do_translate_prep(query, state, progress_msg_id=None):
+    """For videos matching `query`, sync their .en.srt to audio, then ask the
+    user (via Telegram) whether to translate them to Italian.
+
+    Flow:
+      1. Find videos matching the query
+      2. Keep only those with a .en.srt but no .it.srt
+      3. Sync each .en.srt to the video audio (ffsubsync)
+      4. Estimate total cost and post a single message with Traduci/Tieni ENG buttons
+    """
+    matches = find_videos_by_name(query)
+    if not matches:
+        msg = f"❌ Nessun video trovato per '<b>{query}</b>'"
+        if progress_msg_id:
+            tg_edit_message(progress_msg_id, msg)
+        else:
+            tg_send(msg)
+        return
+
+    eligible = []
+    already_it = []
+    no_en = []
+    for video_path in matches:
+        if has_italian_sub(video_path):
+            already_it.append(video_path)
+            continue
+        en_srt = os.path.splitext(video_path)[0] + ".en.srt"
+        if not os.path.exists(en_srt):
+            no_en.append(video_path)
+            continue
+        eligible.append((video_path, en_srt))
+
+    if not eligible:
+        summary = f"📊 <b>Translate prep '{query}'</b>\n\n"
+        summary += f"🇮🇹 Già con sub ITA: {len(already_it)}\n"
+        summary += f"🇬🇧 Senza .en.srt: {len(no_en)}\n\n"
+        summary += "Niente da tradurre. Usa prima la ricerca per scaricare il sub EN."
+        if progress_msg_id:
+            tg_edit_message(progress_msg_id, summary)
+        else:
+            tg_send(summary)
+        return
+
+    total = len(eligible)
+    synced = 0
+    for i, (video_path, en_srt) in enumerate(eligible):
+        if progress_msg_id:
+            bar = _progress_bar(i, total)
+            tg_edit_message(
+                progress_msg_id,
+                f"🔄 <b>Sync EN su audio...</b>\n\n{bar}\n📊 {i}/{total} sincronizzati\n\n"
+                f"<i>{friendly_name(video_path)}</i>",
+            )
+        try:
+            sync_subtitle(video_path, en_srt)
+            synced += 1
+        except Exception as e:
+            log.warning(f"  translate_prep sync failed for {video_path}: {e}")
+
+    en_paths = [vp for vp, _ in eligible]
+    total_cost, total_blocks = _estimate_batch_translation_cost(en_paths)
+
+    summary = f"📊 <b>Translate prep '{query}'</b>\n\n"
+    summary += f"🔄 Sincronizzati: {synced}/{total}\n"
+    if already_it:
+        summary += f"🇮🇹 Già con sub ITA (saltati): {len(already_it)}\n"
+    if no_en:
+        summary += f"🇬🇧 Senza .en.srt (saltati): {len(no_en)}\n"
+    summary += f"\n💰 <b>Costo traduzione stimato: ${total_cost:.2f}</b> ({total_blocks} blocchi)"
+
+    translate_hash = str(abs(hash(tuple(en_paths))))[:8]
+    batches = load_batches()
+    batches[translate_hash] = {"paths": en_paths, "type": "translate"}
+    save_batches(batches)
+
+    keyboard = {"inline_keyboard": [[
+        {"text": f"🤖 Traduci in italiano (${total_cost:.2f})", "callback_data": f"batch_translate:{translate_hash}"},
+        {"text": "🇬🇧 Tieni solo ENG", "callback_data": f"batch_keep_en:{translate_hash}"},
+    ]]}
+    if progress_msg_id:
+        tg_edit_message(progress_msg_id, summary, reply_markup=keyboard)
+    else:
+        tg_send(summary, reply_markup=keyboard)
+
+
 def _estimate_batch_translation_cost(paths):
     """Estimate total translation cost for a list of video paths with .en.srt files."""
     total_cost = 0.0
@@ -2380,6 +2482,11 @@ def _queue_worker(state_ref):
                 msg_id = job.get("msg_id")
                 log.info(f"  Queue: sync '{query}'")
                 do_sync(query, state, progress_msg_id=msg_id)
+            elif job_type == "translate_prep":
+                query = job["query"]
+                msg_id = job.get("msg_id")
+                log.info(f"  Queue: translate_prep '{query}'")
+                do_translate_prep(query, state, progress_msg_id=msg_id)
             elif job_type == "cleanup":
                 msg_id = job.get("msg_id")
                 log.info("  Queue: cleanup placeholders")
