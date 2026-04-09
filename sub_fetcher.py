@@ -835,8 +835,9 @@ class SubdlClient:
             log.error(f"  Subdl download error: {e}")
             return None
 
-    def search_and_download(self, video_path, language="it"):
-        """Search and download best subtitle from Subdl. Returns content bytes or None."""
+    def search_and_download(self, video_path, language="it", trace=None):
+        """Search and download best subtitle from Subdl. Returns content bytes or None.
+        If trace is a list, appends per-attempt entries describing what was tried."""
         parsed = parse_video(video_path)
         season = parsed.get("season") if parsed["type"] == "episode" else None
         episode = parsed.get("episode") if parsed["type"] == "episode" else None
@@ -847,25 +848,39 @@ class SubdlClient:
         if imdb_id:
             time.sleep(DELAY_BETWEEN_API_CALLS)
             results = self.search("", language=language, imdb_id=imdb_id, season=season, episode=episode)
+            if trace is not None:
+                trace.append({"provider": "Subdl", "lang": lang_label,
+                              "method": "imdb", "query": imdb_id, "results": len(results)})
             if results:
-                content = self._try_download(results, video_path)
+                content, reject = self._try_download(results, video_path)
                 if content:
                     return content
+                if trace is not None and reject:
+                    trace[-1]["rejected"] = reject
+        elif trace is not None:
+            trace.append({"provider": "Subdl", "lang": lang_label,
+                          "method": "imdb", "query": "(non risolto)", "results": 0})
 
         # 2. Search by name cascade
         queries = get_search_queries(video_path)
         for query in queries:
             time.sleep(DELAY_BETWEEN_API_CALLS)
             results = self.search(query, language=language, season=season, episode=episode)
+            if trace is not None:
+                trace.append({"provider": "Subdl", "lang": lang_label,
+                              "method": "nome", "query": query, "results": len(results)})
             if results:
-                content = self._try_download(results, video_path)
+                content, reject = self._try_download(results, video_path)
                 if content:
                     return content
+                if trace is not None and reject:
+                    trace[-1]["rejected"] = reject
 
         return None
 
     def _try_download(self, results, video_path, max_tries=3):
-        """Try downloading from results, picking best match first."""
+        """Try downloading from results, picking best match first.
+        Returns (content_bytes_or_None, rejection_reason_or_None)."""
         video_base = os.path.splitext(os.path.basename(video_path))[0].lower()
         parsed = parse_video(video_path)
         video_season = parsed.get("season")
@@ -926,22 +941,28 @@ class SubdlClient:
         if scored:
             log.info(f"  Subdl best match: score={scored[0][0]}, release={scored[0][1].get('release_name', '?')}")
 
+        last_reject = None
         for i, (score, sub) in enumerate(scored[:max_tries]):
             time.sleep(DELAY_BETWEEN_API_CALLS)
             content = self.download(sub)
             if not content:
+                last_reject = "download vuoto"
                 continue
             if is_placeholder_sub(content):
                 log.warning(f"  Subdl result {i+1} looks like placeholder, trying next")
+                last_reject = "placeholder"
                 continue
             # Reject forced/incomplete subs (fewer than 10 dialogue blocks)
             block_count = len(re.findall(rb"\d+\r?\n\d{2}:\d{2}:\d{2}", content))
             if block_count < 10:
                 log.warning(f"  Subdl result {i+1} has only {block_count} blocks (likely forced/signs-only), trying next")
+                last_reject = f"forced/incompleti ({block_count} blocchi)"
                 continue
-            return content
+            return content, None
 
-        return None
+        if scored and not last_reject:
+            last_reject = "nessun candidato valido"
+        return None, last_reject
 
 
 def pick_best(results, video_path):
@@ -1263,9 +1284,10 @@ def translate_srt_with_claude(srt_content, video_name):
     return blocks_to_srt(translated_blocks)
 
 
-def _cascade_search(client, video_path, language, file_hash=None, file_size=0):
+def _cascade_search(client, video_path, language, file_hash=None, file_size=0, trace=None):
     """Search OpenSubtitles using a cascade: hash -> IMDB ID -> name variants.
-    Returns a list of results (may be empty)."""
+    Returns a list of results (may be empty).
+    If trace is a list, appends per-attempt entries describing what was tried."""
     parsed = parse_video(video_path)
     season = parsed.get("season") if parsed["type"] == "episode" else None
     episode = parsed.get("episode") if parsed["type"] == "episode" else None
@@ -1277,10 +1299,17 @@ def _cascade_search(client, video_path, language, file_hash=None, file_size=0):
         try:
             results = client.search_hash(file_hash, file_size)
             log.info(f"  {lang_label} hash search: {len(results)} results")
+            if trace is not None:
+                trace.append({"provider": "OpenSubtitles", "lang": lang_label,
+                              "method": "hash", "query": file_hash, "results": len(results)})
             if results:
                 return results
         except Exception as e:
             log.error(f"  {lang_label} hash search error: {e}")
+            if trace is not None:
+                trace.append({"provider": "OpenSubtitles", "lang": lang_label,
+                              "method": "hash", "query": file_hash, "results": 0,
+                              "error": str(e)})
 
     # 2. IMDB ID search
     imdb_id = find_imdb_id(video_path)
@@ -1288,8 +1317,14 @@ def _cascade_search(client, video_path, language, file_hash=None, file_size=0):
         time.sleep(DELAY_BETWEEN_API_CALLS)
         results = client.search_imdb(imdb_id, season, episode, language=language)
         log.info(f"  {lang_label} IMDB search ({imdb_id}): {len(results)} results")
+        if trace is not None:
+            trace.append({"provider": "OpenSubtitles", "lang": lang_label,
+                          "method": "imdb", "query": imdb_id, "results": len(results)})
         if results:
             return results
+    elif trace is not None:
+        trace.append({"provider": "OpenSubtitles", "lang": lang_label,
+                      "method": "imdb", "query": "(non risolto)", "results": 0})
 
     # 3. Name search cascade
     queries = get_search_queries(video_path)
@@ -1297,6 +1332,9 @@ def _cascade_search(client, video_path, language, file_hash=None, file_size=0):
         time.sleep(DELAY_BETWEEN_API_CALLS)
         results = client.search_name(query, season, episode, language=language)
         log.info(f"  {lang_label} name search \"{query}\": {len(results)} results")
+        if trace is not None:
+            trace.append({"provider": "OpenSubtitles", "lang": lang_label,
+                          "method": "nome", "query": query, "results": len(results)})
         if results:
             return results
 
@@ -1345,15 +1383,18 @@ def _download_first_valid(client, results, video_path, max_tries=15):
     return None, None
 
 
-def search_and_download_english(client, video_path, file_hash=None, file_size=0):
+def search_and_download_english(client, video_path, file_hash=None, file_size=0, trace=None):
     """Search for English subtitles as fallback. Returns content bytes or None."""
-    results = _cascade_search(client, video_path, "eng", file_hash, file_size)
+    results = _cascade_search(client, video_path, "eng", file_hash, file_size, trace=trace)
 
     content, sub = _download_first_valid(client, results, video_path)
     if content:
         log.info(f"  ENG sub downloaded: {sub.get('SubFileName', '?')}")
         return content
-
+    if trace is not None and results:
+        trace.append({"provider": "OpenSubtitles", "lang": "ENG",
+                      "method": "download", "query": "",
+                      "results": len(results), "rejected": "tutti rifiutati (placeholder/invalid)"})
     return None
 
 
@@ -1435,10 +1476,30 @@ def _translate_and_save(eng_content, video_path, state, silent=False, skip_sync=
     return True
 
 
-def do_download(video_path, state, silent=False, translate=True):
+def format_search_trace(trace):
+    """Render a search trace into a compact, Telegram-friendly text block."""
+    if not trace:
+        return ""
+    lines = []
+    for entry in trace:
+        provider = entry.get("provider", "?")
+        lang = entry.get("lang", "?")
+        method = entry.get("method", "")
+        query = entry.get("query", "")
+        n = entry.get("results", 0)
+        rejected = entry.get("rejected") or entry.get("error")
+        loc = f"{provider} {method}".strip()
+        q_part = f" '{query}'" if query else ""
+        suffix = f" → {rejected}" if rejected else ""
+        lines.append(f"  • {loc} {lang}{q_part}: {n}{suffix}")
+    return "\n".join(lines)
+
+
+def do_download(video_path, state, silent=False, translate=True, trace=None):
     """Search and download subtitle for a video file.
     Returns: True (ITA found), "en_only" (EN saved, needs translation), False (nothing found).
-    When translate=False, downloads EN sub but does NOT translate (saves money, user decides later)."""
+    When translate=False, downloads EN sub but does NOT translate (saves money, user decides later).
+    If trace is a list, it is populated with per-attempt search entries."""
     fname = os.path.basename(video_path)
     log.info(f"Downloading sub for: {fname}")
 
@@ -1474,7 +1535,7 @@ def do_download(video_path, state, silent=False, translate=True):
     # STEP 1: Subdl.com — search ITA (primary, no VIP placeholders)
     # =================================================================
     subdl = SubdlClient()
-    ita_content = subdl.search_and_download(video_path, language="it")
+    ita_content = subdl.search_and_download(video_path, language="it", trace=trace)
     if ita_content:
         sub_path = os.path.splitext(video_path)[0] + ".it.srt"
         with open(sub_path, "wb") as f:
@@ -1495,8 +1556,13 @@ def do_download(video_path, state, silent=False, translate=True):
     if os_logged_in:
         try:
             file_hash, file_size = compute_hash(video_path)
-            results = _cascade_search(client, video_path, "ita", file_hash, file_size)
+            results = _cascade_search(client, video_path, "ita", file_hash, file_size, trace=trace)
             content, best = _download_first_valid(client, results, video_path)
+            if trace is not None and results and not content:
+                trace.append({"provider": "OpenSubtitles", "lang": "ITA",
+                              "method": "download", "query": "",
+                              "results": len(results),
+                              "rejected": "tutti rifiutati (placeholder/invalid)"})
 
             if content:
                 sub_path = os.path.splitext(video_path)[0] + ".it.srt"
@@ -1519,11 +1585,11 @@ def do_download(video_path, state, silent=False, translate=True):
     # =================================================================
     log.info(f"  Trying English fallback...")
 
-    eng_content = subdl.search_and_download(video_path, language="en")
+    eng_content = subdl.search_and_download(video_path, language="en", trace=trace)
 
     if not eng_content and os_logged_in:
         file_hash, file_size = compute_hash(video_path)
-        eng_content = search_and_download_english(client, video_path, file_hash, file_size)
+        eng_content = search_and_download_english(client, video_path, file_hash, file_size, trace=trace)
 
     if not eng_content:
         log.warning(f"  No English subs found either for: {fname}")
@@ -1532,7 +1598,11 @@ def do_download(video_path, state, silent=False, translate=True):
         state["asked"][video_path] = {"time": datetime.now().isoformat(), "status": "failed"}
         save_state(state)
         if not silent:
-            tg_send(f"❌ Nessun sub ITA né ENG trovato per:\n<b>{friendly_name(video_path)}</b>")
+            trace_text = format_search_trace(trace)
+            msg = f"❌ Nessun sub ITA né ENG trovato per:\n<b>{friendly_name(video_path)}</b>"
+            if trace_text:
+                msg += f"\n\n<b>Tentativi:</b>\n{trace_text}"
+            tg_send(msg)
         return False
 
     if os_logged_in:
@@ -2511,7 +2581,8 @@ def _queue_worker(state_ref):
                 msg_id = job.get("msg_id")
                 name = friendly_name(video_path)
                 log.info(f"  Queue: processing {os.path.basename(video_path)}")
-                result = do_download(video_path, state, translate=False)
+                trace = []
+                result = do_download(video_path, state, silent=True, translate=False, trace=trace)
                 if result is True and msg_id:
                     tg_edit_message(msg_id, f"✅ Sub ITA scaricato per:\n<b>{name}</b>")
                 elif result == "en_only" and msg_id:
@@ -2535,7 +2606,11 @@ def _queue_worker(state_ref):
                         f"💰 Tradurre in italiano? Costo: <b>${cost:.2f}</b> ({blocks} blocchi)",
                         reply_markup=keyboard)
                 elif not result and msg_id:
-                    tg_edit_message(msg_id, f"❌ Non trovato sub per:\n<b>{name}</b>\nRiproverò tra 24h.")
+                    trace_text = format_search_trace(trace)
+                    fail_msg = f"❌ Nessun sub ITA né ENG trovato per:\n<b>{name}</b>\nRiproverò tra 24h."
+                    if trace_text:
+                        fail_msg += f"\n\n<b>Tentativi:</b>\n{trace_text}"
+                    tg_edit_message(msg_id, fail_msg)
         except Exception as e:
             log.error(f"  Queue worker error: {e}", exc_info=True)
         finally:

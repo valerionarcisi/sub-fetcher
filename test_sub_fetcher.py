@@ -982,6 +982,150 @@ class TestQueueTranslateJobType(unittest.TestCase):
         sub_fetcher.download_queue.task_done()
 
 
+class TestQueueWorkerSingleJobNoDuplicateMessages(unittest.TestCase):
+    """Regression: queue worker for single jobs must not produce duplicate
+    Telegram notifications. do_download must be called with silent=True so
+    only the worker's edit of the original progress message is shown."""
+
+    def _run_one_job(self, job, do_download_result):
+        from unittest.mock import patch
+        from queue import Empty
+        sent = []
+        captured = {}
+
+        def fake_do_download(video_path, state, **kwargs):
+            captured["kwargs"] = kwargs
+            return do_download_result
+
+        # Drain any leftover items so the worker picks up our job first
+        while True:
+            try:
+                sub_fetcher.download_queue.get_nowait()
+                sub_fetcher.download_queue.task_done()
+            except Empty:
+                break
+
+        sub_fetcher.download_queue.put(job)
+
+        # Run the worker body for exactly one job by inlining the per-job
+        # logic via a patched queue.get that raises Empty after the first call.
+        from threading import Thread
+        stop = {"done": False}
+        original_get = sub_fetcher.download_queue.get
+
+        def get_then_stop(*args, **kwargs):
+            if stop["done"]:
+                raise Empty()
+            stop["done"] = True
+            return original_get(*args, **kwargs)
+
+        with patch.object(sub_fetcher, "do_download", side_effect=fake_do_download), \
+             patch.object(sub_fetcher, "tg_send", side_effect=lambda *a, **k: sent.append(("send", a, k)) or {"ok": True, "result": {"message_id": 1}}), \
+             patch.object(sub_fetcher, "tg_edit_message", side_effect=lambda *a, **k: sent.append(("edit", a, k))), \
+             patch.object(sub_fetcher, "load_state", return_value={"asked": {}, "downloaded": {}}), \
+             patch.object(sub_fetcher.download_queue, "get", side_effect=get_then_stop):
+            t = Thread(target=sub_fetcher._queue_worker, args=({},), daemon=True)
+            t.start()
+            t.join(timeout=2.0)
+        return sent, captured
+
+    def test_single_job_passes_silent_true(self):
+        sent, captured = self._run_one_job(
+            {"type": "single", "path": "/media/films/X/X.mkv", "msg_id": 42},
+            do_download_result=False,
+        )
+        self.assertEqual(captured["kwargs"].get("silent"), True,
+            "queue worker must call do_download with silent=True so the "
+            "function does not emit its own user-facing message")
+
+    def test_single_job_failure_emits_only_one_message(self):
+        sent, _ = self._run_one_job(
+            {"type": "single", "path": "/media/films/X/X.mkv", "msg_id": 42},
+            do_download_result=False,
+        )
+        # do_download is mocked so it does not call tg_send itself; the worker
+        # should produce exactly one user-facing notification (an edit of the
+        # original progress message).
+        edits = [s for s in sent if s[0] == "edit"]
+        sends = [s for s in sent if s[0] == "send"]
+        self.assertEqual(len(edits), 1)
+        self.assertEqual(len(sends), 0)
+        self.assertIn("Nessun sub ITA né ENG", str(edits[0]))
+        self.assertIn("Riproverò tra 24h", str(edits[0]))
+
+
+class TestSearchTrace(unittest.TestCase):
+    """do_download should accept a trace list and populate it with what it tried."""
+
+    def test_do_download_accepts_trace_param(self):
+        import inspect
+        sig = inspect.signature(sub_fetcher.do_download)
+        self.assertIn("trace", sig.parameters)
+        self.assertIsNone(sig.parameters["trace"].default)
+
+    def test_format_search_trace_renders_entries(self):
+        trace = [
+            {"provider": "Subdl", "lang": "ITA", "method": "imdb",
+             "query": "tt1234567", "results": 0},
+            {"provider": "Subdl", "lang": "ITA", "method": "nome",
+             "query": "Father Mother", "results": 5,
+             "rejected": "forced/incompleti (3 blocchi)"},
+            {"provider": "OpenSubtitles", "lang": "ITA", "method": "hash",
+             "query": "abc123", "results": 0},
+        ]
+        out = sub_fetcher.format_search_trace(trace)
+        self.assertIn("Subdl imdb ITA 'tt1234567': 0", out)
+        self.assertIn("Subdl nome ITA 'Father Mother': 5", out)
+        self.assertIn("forced/incompleti", out)
+        self.assertIn("OpenSubtitles hash ITA 'abc123': 0", out)
+
+    def test_format_search_trace_handles_empty(self):
+        self.assertEqual(sub_fetcher.format_search_trace([]), "")
+        self.assertEqual(sub_fetcher.format_search_trace(None), "")
+
+    def test_cascade_search_populates_trace(self):
+        class MockClient:
+            token = "fake"
+            def search_hash(self, *a, **kw): return []
+            def search_imdb(self, *a, **kw): return []
+            def search_name(self, query, *a, **kw):
+                return [{"SubFileName": "x.srt"}] if query == "Test" else []
+        trace = []
+        results = sub_fetcher._cascade_search(
+            MockClient(), "/media/films/Test/Test.2024.mkv", "ita",
+            file_hash="deadbeef", file_size=1000, trace=trace,
+        )
+        # Should have entries for hash, imdb, and at least one name search
+        methods = [t["method"] for t in trace]
+        self.assertIn("hash", methods)
+        # name should appear too because hash and imdb returned 0
+        self.assertIn("nome", methods)
+        # The hash entry should have the right query
+        hash_entry = next(t for t in trace if t["method"] == "hash")
+        self.assertEqual(hash_entry["query"], "deadbeef")
+        self.assertEqual(hash_entry["results"], 0)
+
+    def test_subdl_search_and_download_populates_trace(self):
+        from unittest.mock import patch
+        client = sub_fetcher.SubdlClient()
+        trace = []
+        # find_imdb_id returns None so only the name cascade fires
+        with patch.object(sub_fetcher, "find_imdb_id", return_value=None), \
+             patch.object(sub_fetcher, "get_search_queries", return_value=["father mother"]), \
+             patch.object(client, "search", return_value=[]):
+            result = client.search_and_download(
+                "/media/films/Father/Father.Mother.2025.mkv",
+                language="it",
+                trace=trace,
+            )
+        self.assertIsNone(result)
+        self.assertTrue(any(t.get("method") == "nome" and t.get("query") == "father mother"
+                            for t in trace))
+        # Also has the imdb "non risolto" entry
+        self.assertTrue(any(t.get("method") == "imdb" and "non risolto" in t.get("query", "")
+                            for t in trace))
+
+
 # =============================================================================
 # NEW TESTS — batches.json, do_cleanup, do_sync, queue job types
 # =============================================================================
