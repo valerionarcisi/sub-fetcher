@@ -86,7 +86,7 @@ docker compose up -d --build sub-fetcher
 | `/scan` | Force a manual scan |
 | `/costs` | Claude API translation costs |
 | `/sync [name]` | Sync subtitles to video audio |
-| `/translate <name>` | Sync `.en.srt` files matching `<name>` to audio, then ask to translate EN→IT |
+| `/translate <name>` | Sync English subs (`.en.srt`, `.eng.srt`, `.english.srt`) matching `<name>` to audio, then ask to translate EN→IT |
 | `/cleanup` | Find and remove placeholder subtitles |
 | `/excludes` | List excluded folders |
 | `/reset` | Clear cache, rescan from scratch |

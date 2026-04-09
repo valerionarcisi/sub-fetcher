@@ -144,6 +144,9 @@ Extracts `{type, name, year|season+episode}` from the basename:
 4. **Fallback** — strips common quality/codec tags (`720p`, `x264`, `bluray`, etc.) and returns `type: "unknown"`.
 5. **Title normalization** (`_clean_title`) — converts dots/underscores to spaces but preserves internal hyphens (so `Punch-Drunk` is not split).
 
+### English Sub Discovery (`find_english_sub`)
+Checks for an existing English subtitle file alongside the video, trying the common suffixes in priority order: `.en.srt` → `.eng.srt` → `.english.srt`. Used everywhere the code needs to look up an English sub (translate prep, batch translate, cost estimation, single-job worker fallback). Centralising this in one helper prevents the class of bugs where a file saved by Radarr/Sonarr as `.eng.srt` is missed by code that hardcodes `.en.srt`.
+
 ### IMDB ID Discovery (`find_imdb_id`)
 Two-step resolver:
 1. **`_find_imdb_id_from_nfo`** — reads `.nfo` files (Sonarr/Radarr) in the video's directory and parent directory, extracts IMDb ID via regex `tt\d{7,}`.
@@ -197,7 +200,7 @@ Type any text in Telegram to search. Handles dots/underscores in filenames (e.g.
 | `/reset` | Clear state cache |
 | `/help` | Help |
 | `/sync [name]` | Sync all/matching .it.srt to video audio |
-| `/translate <name>` | For videos matching `<name>` with a `.en.srt` but no `.it.srt`, sync each EN sub to audio and then ask the user to confirm the EN→IT translation (Claude). Reuses the batch translate flow. |
+| `/translate <name>` | For videos matching `<name>` with an English sub (`.en.srt`, `.eng.srt`, `.english.srt`) but no `.it.srt`, sync each EN sub to audio and then ask the user to confirm the EN→IT translation (Claude). Reuses the batch translate flow. |
 | `/sub <name>` | Manual search by title |
 | `<text>` | Search for videos matching text |
 
