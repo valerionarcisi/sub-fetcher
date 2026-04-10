@@ -160,6 +160,9 @@ Returns a deduplicated list of search terms:
 2. Series folder name (e.g. "PLUR1BUS")
 3. Cleaned folder name, alpha-only (e.g. "PLURIBUS")
 
+### OpenSubtitles Quota Tracking
+`OSClient.downloads_remaining` is populated from the `remaining` field returned by `POST /download`. The value is appended to the search trace as a `{"_quota": N}` entry and rendered by `format_search_trace` as a final line (`📊 OpenSubtitles download rimanenti: N`). Visible in Telegram failure messages so the user can tell if a failure was caused by quota exhaustion vs. no subs available.
+
 ### Claude API Cost Tracking
 Each translation tracks `input_tokens`, `output_tokens`, and cost (USD) in `state.json`. Accessible via `/costs` Telegram command. Pre-translation estimate shown on Telegram before user confirms.
 

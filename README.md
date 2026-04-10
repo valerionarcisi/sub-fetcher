@@ -98,13 +98,15 @@ Type any text to search your media library (handles dots in filenames).
 
 For each video, the bot tries multiple strategies in order:
 
-1. **Local files**: Check if `.it.srt` or `.en.srt` already exists in the folder
+1. **Local files**: Check if `.it.srt` or `.en.srt` / `.eng.srt` already exists in the folder
 2. **Filename parsing**: Strips scraper/tracker prefixes (`www.SceneTime.com -`, `[YTS.MX]`) and handles year in parentheses (`Film (2002).mkv`)
 3. **IMDb ID resolution**: Reads `.nfo` files written by Radarr/Sonarr; falls back to TMDb lookup by title + year
-4. **Subdl.com ITA**: Search by IMDb ID (most reliable) or by name, with episode matching
-5. **OpenSubtitles.com ITA** (REST v1): Search by file hash → IMDb ID → name, tries up to 15 results skipping VIP placeholders
-6. **Subdl.com ENG**: Save `.en.srt`, sync to audio, ask user to translate
-7. **OpenSubtitles.com ENG**: Same as above
+4. **Subdl.com ITA**: Search by IMDb ID or name → download → **validate sync** (score ≥ 800) → if OK, save .it.srt (fast path, zero Claude cost)
+5. **OpenSubtitles.com ITA** (REST v1): Hash → IMDb ID → name → download → **validate sync** → if OK, save .it.srt
+6. *If ITA sync score too low or no ITA found* → fall through to English:
+7. **Subdl.com ENG** → **validate sync** → save `.en.srt`, ask user to translate
+8. **OpenSubtitles.com ENG** → same as above (if ENG sync fails, save unsynced anyway)
+9. **Failure trace**: shows all attempted providers, methods, results, and OpenSubtitles download quota on Telegram
 
 ## Architecture
 
