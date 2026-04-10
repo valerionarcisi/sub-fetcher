@@ -636,6 +636,7 @@ class OSClient:
         self.api_key = OPENSUBTITLES_API_KEY
         self.available = bool(self.api_key)
         self.token = None  # kept for backwards compat with callers
+        self.downloads_remaining = None  # populated after POST /download
 
     def _headers(self, json_body=False):
         h = {
@@ -739,6 +740,11 @@ class OSClient:
         resp = self._request("POST", "/download", body={"file_id": file_id})
         if not resp:
             return None
+        # Track download quota from response
+        remaining = resp.get("remaining")
+        if remaining is not None:
+            self.downloads_remaining = int(remaining)
+            log.info(f"  OpenSubtitles downloads remaining today: {self.downloads_remaining}")
         link = resp.get("link")
         if not link:
             log.warning(f"  OpenSubtitles download: no link in response ({resp})")
@@ -1520,7 +1526,11 @@ def format_search_trace(trace):
     if not trace:
         return ""
     lines = []
+    quota = None
     for entry in trace:
+        if "_quota" in entry:
+            quota = entry["_quota"]
+            continue
         provider = entry.get("provider", "?")
         lang = entry.get("lang", "?")
         method = entry.get("method", "")
@@ -1531,6 +1541,8 @@ def format_search_trace(trace):
         q_part = f" '{query}'" if query else ""
         suffix = f" → {rejected}" if rejected else ""
         lines.append(f"  • {loc} {lang}{q_part}: {n}{suffix}")
+    if quota is not None:
+        lines.append(f"  📊 OpenSubtitles download rimanenti: {quota}")
     return "\n".join(lines)
 
 
@@ -1644,6 +1656,8 @@ def do_download(video_path, state, silent=False, translate=True, trace=None):
         eng_content = search_and_download_english(client, video_path, file_hash, file_size, trace=trace)
 
     if os_logged_in:
+        if trace is not None and client.downloads_remaining is not None:
+            trace.append({"_quota": client.downloads_remaining})
         client.logout()
 
     if not eng_content:

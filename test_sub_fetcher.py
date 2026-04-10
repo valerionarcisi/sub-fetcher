@@ -1213,6 +1213,16 @@ class TestSearchTrace(unittest.TestCase):
         self.assertEqual(sub_fetcher.format_search_trace([]), "")
         self.assertEqual(sub_fetcher.format_search_trace(None), "")
 
+    def test_format_search_trace_includes_quota(self):
+        trace = [
+            {"provider": "Subdl", "lang": "ITA", "method": "imdb",
+             "query": "tt1234567", "results": 0},
+            {"_quota": 3},
+        ]
+        out = sub_fetcher.format_search_trace(trace)
+        self.assertIn("download rimanenti: 3", out)
+        self.assertIn("Subdl imdb ITA", out)
+
     def test_cascade_search_populates_trace(self):
         class MockClient:
             token = "fake"
