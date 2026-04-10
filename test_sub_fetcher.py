@@ -1054,6 +1054,136 @@ class TestQueueWorkerSingleJobNoDuplicateMessages(unittest.TestCase):
         self.assertIn("Riproverò tra 24h", str(edits[0]))
 
 
+class TestValidateSync(unittest.TestCase):
+    """validate_sync: write, sync, validate score, clean up on failure."""
+
+    def test_returns_ok_when_sync_passes(self):
+        from unittest.mock import patch
+        content = b"1\n00:00:01,000 --> 00:00:02,000\nHi\n"
+        tmp = tempfile.mkdtemp()
+        dest = os.path.join(tmp, "test.it.srt")
+        try:
+            with patch.object(sub_fetcher, "sync_subtitle",
+                              return_value={"ok": True, "score": 900.0, "offset": "0.5", "fps_scale": "1.0"}):
+                result = sub_fetcher.validate_sync("/fake/video.mkv", content, dest)
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["score"], 900.0)
+        finally:
+            shutil.rmtree(tmp)
+
+    def test_removes_file_when_score_too_low(self):
+        from unittest.mock import patch
+        content = b"1\n00:00:01,000 --> 00:00:02,000\nHi\n"
+        tmp = tempfile.mkdtemp()
+        dest = os.path.join(tmp, "test.it.srt")
+        try:
+            with patch.object(sub_fetcher, "sync_subtitle",
+                              return_value={"ok": False, "score": 200.0, "offset": "0", "fps_scale": "1.0"}):
+                result = sub_fetcher.validate_sync("/fake/video.mkv", content, dest)
+            self.assertFalse(result["ok"])
+            self.assertFalse(os.path.exists(dest))
+        finally:
+            shutil.rmtree(tmp)
+
+    def test_removes_file_on_sync_failure(self):
+        from unittest.mock import patch
+        content = b"1\n00:00:01,000 --> 00:00:02,000\nHi\n"
+        tmp = tempfile.mkdtemp()
+        dest = os.path.join(tmp, "test.it.srt")
+        try:
+            with patch.object(sub_fetcher, "sync_subtitle", return_value=False):
+                result = sub_fetcher.validate_sync("/fake/video.mkv", content, dest)
+            self.assertFalse(result)
+            self.assertFalse(os.path.exists(dest))
+        finally:
+            shutil.rmtree(tmp)
+
+
+class TestSyncValidationCascade(unittest.TestCase):
+    """do_download: ITA sync failure should fall through to ENG."""
+
+    def _mock_do_download(self, ita_content, ita_sync_ok, eng_content, eng_sync_ok):
+        from unittest.mock import patch, MagicMock
+        tmp = tempfile.mkdtemp()
+        video = os.path.join(tmp, "Film.2024.mkv")
+        open(video, "w").close()
+
+        def fake_validate(vp, content, dest):
+            if dest.endswith(".it.srt"):
+                if ita_sync_ok:
+                    with open(dest, "wb") as f:
+                        f.write(content if isinstance(content, bytes) else content.encode())
+                    return {"ok": True, "score": 900.0}
+                return {"ok": False, "score": 200.0}
+            elif dest.endswith(".en.srt"):
+                if eng_sync_ok:
+                    with open(dest, "wb") as f:
+                        f.write(content if isinstance(content, bytes) else content.encode())
+                    return {"ok": True, "score": 1000.0}
+                return {"ok": False, "score": 100.0}
+            return False
+
+        subdl_mock = MagicMock()
+        subdl_mock.search_and_download = MagicMock(
+            side_effect=lambda vp, language="it", trace=None: ita_content if language == "it" else eng_content
+        )
+
+        os_client = MagicMock()
+        os_client.login.return_value = False
+        os_client.available = False
+
+        state = {"asked": {}, "downloaded": {}}
+        sent = []
+
+        with patch.object(sub_fetcher, "SubdlClient", return_value=subdl_mock), \
+             patch.object(sub_fetcher, "OSClient", return_value=os_client), \
+             patch.object(sub_fetcher, "validate_sync", side_effect=fake_validate), \
+             patch.object(sub_fetcher, "find_existing_srt", return_value=None), \
+             patch.object(sub_fetcher, "_save_sub_and_update_state"), \
+             patch.object(sub_fetcher, "save_state"), \
+             patch.object(sub_fetcher, "tg_send", side_effect=lambda *a, **k: sent.append(a)):
+            result = sub_fetcher.do_download(video, state, silent=True, translate=False)
+
+        shutil.rmtree(tmp)
+        return result
+
+    def test_good_ita_sync_returns_true(self):
+        result = self._mock_do_download(
+            ita_content=b"1\n00:00:01,000 --> 00:00:02,000\nCiao\n",
+            ita_sync_ok=True,
+            eng_content=None,
+            eng_sync_ok=False,
+        )
+        self.assertTrue(result)
+
+    def test_bad_ita_sync_falls_through_to_eng(self):
+        result = self._mock_do_download(
+            ita_content=b"1\n00:00:01,000 --> 00:00:02,000\nCiao\n",
+            ita_sync_ok=False,
+            eng_content=b"1\n00:00:01,000 --> 00:00:02,000\nHi\n",
+            eng_sync_ok=True,
+        )
+        self.assertEqual(result, "en_only")
+
+    def test_no_ita_no_eng_returns_false(self):
+        result = self._mock_do_download(
+            ita_content=None,
+            ita_sync_ok=False,
+            eng_content=None,
+            eng_sync_ok=False,
+        )
+        self.assertFalse(result)
+
+    def test_bad_ita_bad_eng_sync_still_saves_eng(self):
+        result = self._mock_do_download(
+            ita_content=b"1\n00:00:01,000 --> 00:00:02,000\nCiao\n",
+            ita_sync_ok=False,
+            eng_content=b"1\n00:00:01,000 --> 00:00:02,000\nHi\n",
+            eng_sync_ok=False,
+        )
+        self.assertEqual(result, "en_only")
+
+
 class TestSearchTrace(unittest.TestCase):
     """do_download should accept a trace list and populate it with what it tried."""
 

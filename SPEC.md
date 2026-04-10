@@ -31,25 +31,22 @@ VIDEO FILE DISCOVERED
         |     |-- Unknown → Continue
         |
         v
-    [STEP 1: SUBDL.COM — SEARCH ITA (primary, no VIP placeholders)]
-        |-- Search by IMDB ID (from .nfo files)
-        |-- Search by name cascade (filename → folder → cleaned folder)
-        |-- Episode matching: +500 for correct S01E01, -1000 for wrong episode
-        |-- Download from ZIP → Validate → Sync + DONE
+    [STEP 1: SEARCH ITA — SUBDL + OPENSUBTITLES, VALIDATE SYNC]
+        |-- Subdl ITA: Search by IMDB ID → name cascade → download
+        |     |-- validate_sync(video, content, .it.srt, min_score=800)
+        |     |-- Score OK? → DONE (fast path, zero Claude cost)
+        |     |-- Score too low? → discard, try next provider
+        |-- OpenSubtitles ITA: Hash → IMDB → name → download
+        |     |-- validate_sync → Score OK? → DONE
+        |     |-- Score too low? → discard, fall through to ENG
         |
         v
-    [STEP 2: OPENSUBTITLES — SEARCH ITA (fallback)]
-        |-- Hash search (file hash + size)
-        |-- IMDB ID search
-        |-- Name search cascade
-        |-- Try up to 5 results (skip VIP placeholders) → Sync + DONE
-        |
-        v
-    [STEP 3: ENGLISH FALLBACK — DOWNLOAD ONLY (FREE)]
+    [STEP 2: ENGLISH FALLBACK — DOWNLOAD + VALIDATE SYNC]
         |-- Subdl.com ENG search (IMDB → name)
-        |-- OpenSubtitles ENG search (hash → IMDB → name, try up to 5)
-        |-- Save .en.srt
-        |-- Sync .en.srt to audio with ffsubsync
+        |-- OpenSubtitles ENG search (hash → IMDB → name, try up to 15)
+        |-- validate_sync(video, content, .en.srt, min_score=800)
+        |-- Score OK? → save synced .en.srt → return "en_only"
+        |-- Score too low? → save unsynced .en.srt anyway (better than nothing)
         |-- Return "en_only" result
         |
         v
@@ -98,6 +95,9 @@ VIDEO FILE DISCOVERED
 
 ### Italian Audio Detection (`has_italian_audio`)
 Uses `ffprobe` to inspect audio stream metadata. Checks `language` tag for "ita"/"it"/"italian" and `title` tag for Italian keywords. Videos with Italian audio are skipped (no need for Italian subtitles).
+
+### Sync Validation (`validate_sync`)
+Writes subtitle content to a temp path, syncs it via `sync_subtitle(min_score=SYNC_MIN_SCORE)`, and validates the score. If the score is too low (< 800 by default), removes the file and returns `{"ok": False, ...}`. This is the gate that decides whether an ITA sub is good enough to save or should be discarded in favour of an ENG fallback.
 
 ### Subtitle Sync (`sync_subtitle`)
 Uses `ffsubsync` to align subtitle timecodes to the video's audio track via Voice Activity Detection. Analyzes when speech occurs in the audio and aligns subtitle timecodes accordingly. Calculates both time offset (seconds) and framerate scale factor for different video releases. Uses `os.system()` shell execution (not `subprocess.run` with pipes, which interferes with ffsubsync's `rich` library). Non-blocking: if sync fails, the unsynchronized subtitle is kept. Timeout: 5 minutes.

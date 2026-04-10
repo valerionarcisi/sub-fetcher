@@ -86,6 +86,9 @@ DELAY_BETWEEN_API_CALLS = 2  # seconds
 RETRY_AFTER_HOURS = 72  # don't re-ask for 3 days after "no"
 FAILED_RETRY_HOURS = 24  # retry failed downloads after 24h
 
+# Subtitle sync validation
+SYNC_MIN_SCORE = 800  # ffsubsync score threshold — reject subs that don't match the video
+
 # Video extensions
 VIDEO_EXTENSIONS = {".mkv", ".mp4", ".avi", ".m4v", ".wmv", ".ts"}
 
@@ -1039,6 +1042,42 @@ def sync_subtitle(video_path, srt_path, min_score=0):
     return False
 
 
+def validate_sync(video_path, content_bytes, dest_path):
+    """Write subtitle content to dest_path, sync it to the video audio,
+    and validate the sync score against SYNC_MIN_SCORE.
+
+    Returns:
+      {"ok": True, "score": float}  — sync passed, dest_path contains synced sub
+      {"ok": False, "score": float} — sync ran but score too low, dest_path removed
+      False                         — sync completely failed, dest_path removed
+    """
+    try:
+        with open(dest_path, "wb") as f:
+            f.write(content_bytes if isinstance(content_bytes, bytes)
+                    else content_bytes.encode("utf-8"))
+    except Exception as e:
+        log.error(f"  validate_sync: failed to write {dest_path}: {e}")
+        return False
+
+    result = sync_subtitle(video_path, dest_path, min_score=SYNC_MIN_SCORE)
+
+    if result and result.get("ok"):
+        return result
+
+    # Sync failed or score too low — clean up the file
+    try:
+        if os.path.exists(dest_path):
+            os.remove(dest_path)
+    except Exception:
+        pass
+
+    if result and not result.get("ok"):
+        log.warning(f"  validate_sync: score {result.get('score', '?')} < {SYNC_MIN_SCORE}, discarding")
+        return result
+
+    return False
+
+
 # =============================================================================
 # SUBTITLE VALIDATION (detect VIP placeholders)
 # =============================================================================
@@ -1532,27 +1571,34 @@ def do_download(video_path, state, silent=False, translate=True, trace=None):
                 return "en_only"
 
     # =================================================================
-    # STEP 1: Subdl.com — search ITA (primary, no VIP placeholders)
+    # STEP 1: Search ITA — Subdl then OpenSubtitles, validate sync
     # =================================================================
     subdl = SubdlClient()
-    ita_content = subdl.search_and_download(video_path, language="it", trace=trace)
-    if ita_content:
-        sub_path = os.path.splitext(video_path)[0] + ".it.srt"
-        with open(sub_path, "wb") as f:
-            f.write(ita_content)
-        sync_subtitle(video_path, sub_path)
-        _save_sub_and_update_state(video_path, sub_path, "Subdl.com", state)
-        log.info(f"  ✅ Saved (Subdl): {os.path.basename(sub_path)}")
-        if not silent:
-            tg_send(f"✅ Sub ITA scaricato (Subdl):\n<b>{friendly_name(video_path)}</b>\n📁 {os.path.basename(sub_path)}")
-        return True
-
-    # =================================================================
-    # STEP 2: OpenSubtitles — hash search ITA (fallback, best for exact match)
-    # =================================================================
     client = OSClient()
     os_logged_in = client.login()
+    sub_path = os.path.splitext(video_path)[0] + ".it.srt"
 
+    # --- Subdl ITA ---
+    ita_content = subdl.search_and_download(video_path, language="it", trace=trace)
+    if ita_content:
+        sync_result = validate_sync(video_path, ita_content, sub_path)
+        if sync_result and sync_result.get("ok"):
+            _save_sub_and_update_state(video_path, sub_path, "Subdl.com", state)
+            log.info(f"  ✅ Saved (Subdl, sync score {sync_result['score']:.0f}): {os.path.basename(sub_path)}")
+            if not silent:
+                tg_send(f"✅ Sub ITA scaricato (Subdl):\n<b>{friendly_name(video_path)}</b>\n📁 {os.path.basename(sub_path)}")
+            if os_logged_in:
+                client.logout()
+            return True
+        else:
+            score_val = sync_result.get("score", "?") if isinstance(sync_result, dict) else "N/A"
+            log.warning(f"  Subdl ITA sync score too low ({score_val}), discarding")
+            if trace is not None:
+                trace.append({"provider": "Subdl", "lang": "ITA",
+                              "method": "sync", "query": "",
+                              "results": 1, "rejected": f"sync score troppo basso ({score_val})"})
+
+    # --- OpenSubtitles ITA ---
     if os_logged_in:
         try:
             file_hash, file_size = compute_hash(video_path)
@@ -1565,36 +1611,43 @@ def do_download(video_path, state, silent=False, translate=True, trace=None):
                               "rejected": "tutti rifiutati (placeholder/invalid)"})
 
             if content:
-                sub_path = os.path.splitext(video_path)[0] + ".it.srt"
-                with open(sub_path, "wb") as f:
-                    f.write(content)
-                sync_subtitle(video_path, sub_path)
-                _save_sub_and_update_state(video_path, sub_path, f"OpenSubtitles: {best.get('SubFileName', '')}", state)
-                log.info(f"  ✅ Saved (OS): {os.path.basename(sub_path)}")
-                if not silent:
-                    tg_send(f"✅ Sub ITA scaricato (OS):\n<b>{friendly_name(video_path)}</b>\n📁 {os.path.basename(sub_path)}")
-                client.logout()
-                return True
+                sync_result = validate_sync(video_path, content, sub_path)
+                if sync_result and sync_result.get("ok"):
+                    _save_sub_and_update_state(video_path, sub_path, f"OpenSubtitles: {best.get('SubFileName', '')}", state)
+                    log.info(f"  ✅ Saved (OS, sync score {sync_result['score']:.0f}): {os.path.basename(sub_path)}")
+                    if not silent:
+                        tg_send(f"✅ Sub ITA scaricato (OS):\n<b>{friendly_name(video_path)}</b>\n📁 {os.path.basename(sub_path)}")
+                    client.logout()
+                    return True
+                else:
+                    score_val = sync_result.get("score", "?") if isinstance(sync_result, dict) else "N/A"
+                    log.warning(f"  OS ITA sync score too low ({score_val}), discarding")
+                    if trace is not None:
+                        trace.append({"provider": "OpenSubtitles", "lang": "ITA",
+                                      "method": "sync", "query": "",
+                                      "results": 1, "rejected": f"sync score troppo basso ({score_val})"})
         except Exception as e:
             log.error(f"  OpenSubtitles error: {e}")
 
-    log.warning(f"  No Italian subs found for: {fname}")
+    log.warning(f"  No valid Italian subs for: {fname}")
 
     # =================================================================
-    # STEP 3: ENG fallback — download and sync EN sub
+    # STEP 2: ENG fallback — download, validate sync, save .en.srt
     # =================================================================
     log.info(f"  Trying English fallback...")
 
+    en_srt_path = os.path.splitext(video_path)[0] + ".en.srt"
     eng_content = subdl.search_and_download(video_path, language="en", trace=trace)
 
     if not eng_content and os_logged_in:
         file_hash, file_size = compute_hash(video_path)
         eng_content = search_and_download_english(client, video_path, file_hash, file_size, trace=trace)
 
+    if os_logged_in:
+        client.logout()
+
     if not eng_content:
         log.warning(f"  No English subs found either for: {fname}")
-        if os_logged_in:
-            client.logout()
         state["asked"][video_path] = {"time": datetime.now().isoformat(), "status": "failed"}
         save_state(state)
         if not silent:
@@ -1605,23 +1658,18 @@ def do_download(video_path, state, silent=False, translate=True, trace=None):
             tg_send(msg)
         return False
 
-    if os_logged_in:
-        client.logout()
-
-    en_srt_path = os.path.splitext(video_path)[0] + ".en.srt"
-    try:
-        if isinstance(eng_content, bytes):
+    # Try to sync ENG — if sync fails, save anyway (better than nothing)
+    sync_result = validate_sync(video_path, eng_content, en_srt_path)
+    if not sync_result or not sync_result.get("ok"):
+        # validate_sync removed the file on failure — write it back unsyncedtry:
+        try:
             with open(en_srt_path, "wb") as f:
-                f.write(eng_content)
-        else:
-            with open(en_srt_path, "w", encoding="utf-8") as f:
-                f.write(eng_content)
-        log.info(f"  Saved English sub: {os.path.basename(en_srt_path)}")
-        sync_result = sync_subtitle(video_path, en_srt_path, min_score=1000)
-        if isinstance(sync_result, dict) and not sync_result["ok"]:
-            log.warning(f"  EN sub sync score too low ({sync_result['score']:.0f}), sub may not match this video")
-    except Exception as e:
-        log.warning(f"  Failed to save/sync English sub: {e}")
+                f.write(eng_content if isinstance(eng_content, bytes) else eng_content.encode("utf-8"))
+            log.warning(f"  ENG sync failed/low score, saving unsynced: {os.path.basename(en_srt_path)}")
+        except Exception as e:
+            log.warning(f"  Failed to save English sub: {e}")
+    else:
+        log.info(f"  Saved synced English sub (score {sync_result['score']:.0f}): {os.path.basename(en_srt_path)}")
 
     if not translate:
         log.info(f"  ✅ EN sub saved (translation deferred, user will decide)")
