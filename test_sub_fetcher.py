@@ -457,6 +457,78 @@ class TestFindEnglishSub(unittest.TestCase):
             shutil.rmtree(tmp)
 
 
+class TestAutoEnqueueMissing(unittest.TestCase):
+    """auto_enqueue_missing should put download jobs in the queue without
+    asking for user confirmation."""
+
+    def _drain_queue(self):
+        from queue import Empty
+        items = []
+        while True:
+            try:
+                items.append(sub_fetcher.download_queue.get_nowait())
+                sub_fetcher.download_queue.task_done()
+            except Empty:
+                break
+        return items
+
+    def test_single_film_enqueues_single_job(self):
+        from unittest.mock import patch
+        self._drain_queue()
+        with patch.object(sub_fetcher, "tg_send",
+                          return_value={"ok": True, "result": {"message_id": 1}}), \
+             patch.object(sub_fetcher, "save_state"), \
+             patch.object(sub_fetcher, "queue_position", return_value=0), \
+             patch("time.sleep"):
+            sub_fetcher.auto_enqueue_missing(
+                ["/media/films/Film.2024/Film.2024.mkv"],
+                state={"asked": {}, "downloaded": {}},
+            )
+        items = self._drain_queue()
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["type"], "single")
+        self.assertEqual(items[0]["path"], "/media/films/Film.2024/Film.2024.mkv")
+
+    def test_series_with_multiple_episodes_enqueues_one_batch(self):
+        from unittest.mock import patch
+        self._drain_queue()
+        paths = [
+            "/media/series/Pluribus/Pluribus.S01E01.mkv",
+            "/media/series/Pluribus/Pluribus.S01E02.mkv",
+            "/media/series/Pluribus/Pluribus.S01E03.mkv",
+        ]
+        with patch.object(sub_fetcher, "tg_send",
+                          return_value={"ok": True, "result": {"message_id": 1}}), \
+             patch.object(sub_fetcher, "save_state"), \
+             patch.object(sub_fetcher, "queue_position", return_value=0), \
+             patch("time.sleep"):
+            sub_fetcher.auto_enqueue_missing(paths, state={"asked": {}, "downloaded": {}})
+        items = self._drain_queue()
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["type"], "batch")
+        self.assertEqual(set(items[0]["paths"]), set(paths))
+
+    def test_no_confirmation_buttons_in_messages(self):
+        """Verify the new flow does not send any keyboard with Scarica/No buttons."""
+        from unittest.mock import patch
+        self._drain_queue()
+        sent = []
+        with patch.object(sub_fetcher, "tg_send",
+                          side_effect=lambda *a, **k: sent.append((a, k)) or {"ok": True, "result": {"message_id": 1}}), \
+             patch.object(sub_fetcher, "save_state"), \
+             patch.object(sub_fetcher, "queue_position", return_value=0), \
+             patch("time.sleep"):
+            sub_fetcher.auto_enqueue_missing(
+                ["/media/films/Film.mkv"],
+                state={"asked": {}, "downloaded": {}},
+            )
+        self._drain_queue()
+        for args, kwargs in sent:
+            self.assertNotIn("reply_markup", kwargs,
+                "auto_enqueue should not send confirmation buttons")
+            self.assertNotIn("Scarica?", str(args))
+
+
 class TestOfferDelete(unittest.TestCase):
     """offer_delete: list subs and offer confirmation."""
 

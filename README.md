@@ -22,9 +22,9 @@ Automated Italian subtitle downloader with Telegram bot interface. Scans your me
 ```
 Scan media folders → Find missing .it.srt → Group by series/film
         ↓
-Ask user via Telegram (1 message per series, individual for films)
+Auto-enqueue download (no "Scarica?" prompt — subs are always wanted)
         ↓
-User clicks "Scarica tutti" → Phase 1 (FREE):
+Phase 1 (FREE):
   1. Check local folder for existing subs
   2. Search Subdl.com (ITA) → download directly
   3. Search OpenSubtitles (ITA) → download (skip placeholders)

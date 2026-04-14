@@ -13,13 +13,11 @@ VIDEO FILE DISCOVERED
         |-- Already asked/downloaded/failed (within cooldown)? → SKIP
         |
         v
-    [TELEGRAM NOTIFICATION]
-        |-- Multiple episodes in same series → 1 grouped message
-        |-- Multiple single films → 1 digest message
-        |-- Single file alone → 1 individual message
-        |
-        v
-    USER CLICKS "SCARICA"
+    [AUTO-ENQUEUE FOR DOWNLOAD]
+        |-- Multiple episodes in same series → 1 batch job + 1 "in coda" message
+        |-- Single file → 1 single job + 1 "in coda" message
+        |-- No user confirmation prompt — subs are always wanted.
+        |   The cost gate is on Claude translation, asked later if only ENG was found.
         |
         v
     [STEP 0: CHECK LOCAL FILES]
@@ -170,8 +168,9 @@ Each translation tracks `input_tokens`, `output_tokens`, and cost (USD) in `stat
 ## Telegram UX
 
 ### Notifications
-- **Series with multiple episodes**: 1 grouped message per series with episode list + "Scarica tutti" button
-- **Films**: 1 individual message per film with Scarica/No/Escludi buttons
+- **Auto-enqueue on scan**: scan results are automatically queued for download — no "Scarica?" prompt. The bot sends one "⬇️ Scaricando sub per ..." message per video / per series and updates it in place when the download completes (✅ ITA / 🇬🇧 ENG-only / ❌ failed).
+- **Cost gate stays**: when only an ENG sub is found, the user is asked whether to translate via Claude (cost shown). This is the only confirmation prompt the bot still issues.
+- The legacy `ask_user` and `_send_batch_message` keyboards are still in the codebase for `/sub` manual searches (`search_and_offer`) but are no longer triggered by the periodic scan.
 
 ### Two-Phase Batch Flow
 1. User clicks "Scarica tutti (9)" → downloads EN subs (free)

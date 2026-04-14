@@ -1816,23 +1816,49 @@ def _send_batch_message(folder, paths, state):
     return batch_hash
 
 
-def ask_user_grouped(missing, state):
-    """Send grouped Telegram messages: one per series, one digest for all single films."""
+def auto_enqueue_missing(missing, state):
+    """Auto-queue all missing videos for download. Notify Telegram with a
+    single 'in coda' message per file/series. The user does not need to
+    confirm — subs are always wanted (the cost gate is on Claude translation,
+    enforced later in the queue worker)."""
     groups = group_by_series(missing)
 
-    # Separate multi-episode groups from single-file groups
+    # Multi-episode series → one batch job per series
     singles = []
     for folder, paths in groups.items():
         if len(paths) > 1:
-            _send_batch_message(folder, paths, state)
-            time.sleep(1)
+            pos = queue_position()
+            result = tg_send(
+                f"⬇️ <b>Scaricando sub per {folder}</b>\n"
+                f"📁 {len(paths)} file"
+                + (f"\n⏳ In coda (posizione {pos + 1})" if pos > 0 else "")
+            )
+            msg_id = result["result"]["message_id"] if result and result.get("ok") else None
+            for p in paths:
+                state["asked"][p] = {"time": datetime.now().isoformat(), "status": "pending"}
+            download_queue.put({"type": "batch", "paths": paths, "msg_id": msg_id})
+            time.sleep(0.5)
         else:
             singles.append(paths[0])
 
-    # Send individual messages for each single film
+    # Single films → one job each
     for p in singles:
-        ask_user(p, state)
-        time.sleep(0.5)
+        pos = queue_position()
+        result = tg_send(
+            f"⬇️ <b>Scaricando sub per</b>\n"
+            f"📁 {friendly_name(p)}"
+            + (f"\n⏳ In coda (posizione {pos + 1})" if pos > 0 else "")
+        )
+        msg_id = result["result"]["message_id"] if result and result.get("ok") else None
+        state["asked"][p] = {"time": datetime.now().isoformat(), "status": "pending"}
+        download_queue.put({"type": "single", "path": p, "msg_id": msg_id})
+        time.sleep(0.3)
+
+    save_state(state)
+
+
+# Backwards-compatible alias — kept in case anything still references it.
+ask_user_grouped = auto_enqueue_missing
 
 
 def find_path_by_hash(state, path_hash):
