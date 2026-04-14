@@ -102,12 +102,13 @@ For each video, the bot tries multiple strategies in order:
 1. **Local files**: Check if `.it.srt` or `.en.srt` / `.eng.srt` already exists in the folder
 2. **Filename parsing**: Strips scraper/tracker prefixes (`www.SceneTime.com -`, `[YTS.MX]`) and handles year in parentheses (`Film (2002).mkv`)
 3. **IMDb ID resolution**: Reads `.nfo` files written by Radarr/Sonarr; falls back to TMDb lookup by title + year
-4. **Subdl.com ITA**: Search by IMDb ID or name → download → **validate sync** (score ≥ 800) → if OK, save .it.srt (fast path, zero Claude cost)
-5. **OpenSubtitles.com ITA** (REST v1): Hash → IMDb ID → name → download → **validate sync** → if OK, save .it.srt
-6. *If ITA sync score too low or no ITA found* → fall through to English:
-7. **Subdl.com ENG** → **validate sync** → save `.en.srt`, ask user to translate
-8. **OpenSubtitles.com ENG** → same as above (if ENG sync fails, discard — consistent with ITA path)
-9. **Failure trace**: shows all attempted providers, methods, results, and OpenSubtitles download quota on Telegram
+4. **Try ITA**: Subdl → OpenSubtitles → validate sync (score ≥ 800) → save `.it.srt` if good
+5. **Always try ENG too**: Subdl → OpenSubtitles → validate sync → save `.en.srt` if good (runs regardless of whether ITA was found, so EN is always available as backup or for later translation)
+6. **Outcome**:
+   - **Both saved** → notify "ITA scaricato" + list both files
+   - **Only ENG saved** → notify "ENG salvato, tradurre?" with `[Traduci]` / `[Tieni ENG]` buttons
+   - **Neither saved** → notify failure with full search trace and OpenSubtitles quota remaining
+7. **Failure trace** shows all attempted providers, methods, sync scores, and OpenSubtitles download quota
 
 ## Architecture
 

@@ -1237,6 +1237,47 @@ class TestSyncValidationCascade(unittest.TestCase):
         )
         self.assertTrue(result)
 
+    def test_both_ita_and_eng_saved_when_available(self):
+        """Even when ITA is found, ENG should also be downloaded as backup."""
+        from unittest.mock import patch, MagicMock
+        tmp = tempfile.mkdtemp()
+        video = os.path.join(tmp, "Film.2024.mkv")
+        open(video, "w").close()
+
+        saved_paths = []
+
+        def fake_validate(vp, content, dest):
+            saved_paths.append(dest)
+            with open(dest, "wb") as f:
+                f.write(content if isinstance(content, bytes) else content.encode())
+            return {"ok": True, "score": 900.0}
+
+        subdl_mock = MagicMock()
+        subdl_mock.search_and_download = MagicMock(
+            side_effect=lambda vp, language="it", trace=None: b"sub-content"
+        )
+        os_client = MagicMock()
+        os_client.login.return_value = False
+        os_client.available = False
+        os_client.downloads_remaining = None
+
+        state = {"asked": {}, "downloaded": {}}
+        try:
+            with patch.object(sub_fetcher, "SubdlClient", return_value=subdl_mock), \
+                 patch.object(sub_fetcher, "OSClient", return_value=os_client), \
+                 patch.object(sub_fetcher, "validate_sync", side_effect=fake_validate), \
+                 patch.object(sub_fetcher, "find_existing_srt", return_value=None), \
+                 patch.object(sub_fetcher, "_save_sub_and_update_state"), \
+                 patch.object(sub_fetcher, "save_state"), \
+                 patch.object(sub_fetcher, "tg_send"):
+                result = sub_fetcher.do_download(video, state, silent=True, translate=False)
+            self.assertTrue(result)
+            # Both .it.srt and .en.srt were written
+            self.assertTrue(any(p.endswith(".it.srt") for p in saved_paths))
+            self.assertTrue(any(p.endswith(".en.srt") for p in saved_paths))
+        finally:
+            shutil.rmtree(tmp)
+
     def test_bad_ita_sync_falls_through_to_eng(self):
         result = self._mock_do_download(
             ita_content=b"1\n00:00:01,000 --> 00:00:02,000\nCiao\n",

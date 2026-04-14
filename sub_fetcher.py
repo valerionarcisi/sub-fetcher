@@ -1583,85 +1583,41 @@ def do_download(video_path, state, silent=False, translate=True, trace=None):
                 return "en_only"
 
     # =================================================================
-    # STEP 1: Search ITA — Subdl then OpenSubtitles, validate sync
+    # STEP 1: Search & save ITA (if available + sync OK)
     # =================================================================
     subdl = SubdlClient()
     client = OSClient()
     os_logged_in = client.login()
     sub_path = os.path.splitext(video_path)[0] + ".it.srt"
-
-    # --- Subdl ITA ---
-    ita_content = subdl.search_and_download(video_path, language="it", trace=trace)
-    if ita_content:
-        sync_result = validate_sync(video_path, ita_content, sub_path)
-        if sync_result and sync_result.get("ok"):
-            _save_sub_and_update_state(video_path, sub_path, "Subdl.com", state)
-            log.info(f"  ✅ Saved (Subdl, sync score {sync_result['score']:.0f}): {os.path.basename(sub_path)}")
-            if not silent:
-                tg_send(f"✅ Sub ITA scaricato (Subdl):\n<b>{friendly_name(video_path)}</b>\n📁 {os.path.basename(sub_path)}")
-            if os_logged_in:
-                client.logout()
-            return True
-        else:
-            score_val = sync_result.get("score", "?") if isinstance(sync_result, dict) else "N/A"
-            log.warning(f"  Subdl ITA sync score too low ({score_val}), discarding")
-            if trace is not None:
-                trace.append({"provider": "Subdl", "lang": "ITA",
-                              "method": "sync", "query": "",
-                              "results": 1, "rejected": f"sync score troppo basso ({score_val})"})
-
-    # --- OpenSubtitles ITA ---
-    if os_logged_in:
-        try:
-            file_hash, file_size = compute_hash(video_path)
-            results = _cascade_search(client, video_path, "ita", file_hash, file_size, trace=trace)
-            content, best = _download_first_valid(client, results, video_path)
-            if trace is not None and results and not content:
-                trace.append({"provider": "OpenSubtitles", "lang": "ITA",
-                              "method": "download", "query": "",
-                              "results": len(results),
-                              "rejected": "tutti rifiutati (placeholder/invalid)"})
-
-            if content:
-                sync_result = validate_sync(video_path, content, sub_path)
-                if sync_result and sync_result.get("ok"):
-                    _save_sub_and_update_state(video_path, sub_path, f"OpenSubtitles: {best.get('SubFileName', '')}", state)
-                    log.info(f"  ✅ Saved (OS, sync score {sync_result['score']:.0f}): {os.path.basename(sub_path)}")
-                    if not silent:
-                        tg_send(f"✅ Sub ITA scaricato (OS):\n<b>{friendly_name(video_path)}</b>\n📁 {os.path.basename(sub_path)}")
-                    client.logout()
-                    return True
-                else:
-                    score_val = sync_result.get("score", "?") if isinstance(sync_result, dict) else "N/A"
-                    log.warning(f"  OS ITA sync score too low ({score_val}), discarding")
-                    if trace is not None:
-                        trace.append({"provider": "OpenSubtitles", "lang": "ITA",
-                                      "method": "sync", "query": "",
-                                      "results": 1, "rejected": f"sync score troppo basso ({score_val})"})
-        except Exception as e:
-            log.error(f"  OpenSubtitles error: {e}")
-
-    log.warning(f"  No valid Italian subs for: {fname}")
-
-    # =================================================================
-    # STEP 2: ENG fallback — download, validate sync, save .en.srt
-    # =================================================================
-    log.info(f"  Trying English fallback...")
-
     en_srt_path = os.path.splitext(video_path)[0] + ".en.srt"
-    eng_content = subdl.search_and_download(video_path, language="en", trace=trace)
 
-    if not eng_content and os_logged_in:
-        file_hash, file_size = compute_hash(video_path)
-        eng_content = search_and_download_english(client, video_path, file_hash, file_size, trace=trace)
+    ita_saved = _try_save_ita(subdl, client, os_logged_in, video_path, sub_path, state, trace)
+
+    # =================================================================
+    # STEP 2: Search & save ENG (always — useful as backup or for translation)
+    # =================================================================
+    eng_saved = _try_save_eng(subdl, client, os_logged_in, video_path, en_srt_path, trace)
 
     if os_logged_in:
         if trace is not None and client.downloads_remaining is not None:
             trace.append({"_quota": client.downloads_remaining})
         client.logout()
 
-    if not eng_content:
-        log.warning(f"  No English subs found either for: {fname}")
+    # =================================================================
+    # STEP 3: Decide outcome and notify user
+    # =================================================================
+    if ita_saved:
+        log.info(f"  ✅ ITA saved" + (" + ENG saved" if eng_saved else ""))
+        if not silent:
+            files = f"📁 {os.path.basename(sub_path)}"
+            if eng_saved:
+                files += f"\n📁 {os.path.basename(en_srt_path)}"
+            tg_send(f"✅ Sub ITA scaricato:\n<b>{friendly_name(video_path)}</b>\n{files}")
+        return True
+
+    # No ITA — fall through to ENG-only path
+    if not eng_saved:
+        log.warning(f"  No valid subs (ITA or ENG) found for: {fname}")
         state["asked"][video_path] = {"time": datetime.now().isoformat(), "status": "failed"}
         save_state(state)
         if not silent:
@@ -1672,42 +1628,80 @@ def do_download(video_path, state, silent=False, translate=True, trace=None):
             tg_send(msg)
         return False
 
-    # Validate ENG sync — discard if score too low (consistent with ITA path)
+    # Only ENG was saved — caller decides about translation
+    log.info(f"  ✅ EN sub saved (no ITA found, translation deferred)")
+    if translate and CLAUDE_API_KEY:
+        if _translate_and_save(en_srt_path, video_path, state, silent=silent, skip_sync=True):
+            return True
+    return "en_only"
+
+
+def _try_save_ita(subdl, client, os_logged_in, video_path, sub_path, state, trace):
+    """Search ITA on Subdl then OpenSubtitles, validate sync, save .it.srt.
+    Returns True if a synced ITA sub was saved."""
+    # --- Subdl ITA ---
+    ita_content = subdl.search_and_download(video_path, language="it", trace=trace)
+    if ita_content:
+        sync_result = validate_sync(video_path, ita_content, sub_path)
+        if sync_result and sync_result.get("ok"):
+            _save_sub_and_update_state(video_path, sub_path, "Subdl.com", state)
+            log.info(f"  ✅ Saved ITA (Subdl, sync score {sync_result['score']:.0f}): {os.path.basename(sub_path)}")
+            return True
+        score_val = sync_result.get("score", "?") if isinstance(sync_result, dict) else "N/A"
+        log.warning(f"  Subdl ITA sync score too low ({score_val}), discarding")
+        if trace is not None:
+            trace.append({"provider": "Subdl", "lang": "ITA", "method": "sync", "query": "",
+                          "results": 1, "rejected": f"sync score troppo basso ({score_val})"})
+
+    # --- OpenSubtitles ITA ---
+    if os_logged_in:
+        try:
+            file_hash, file_size = compute_hash(video_path)
+            results = _cascade_search(client, video_path, "ita", file_hash, file_size, trace=trace)
+            content, best = _download_first_valid(client, results, video_path)
+            if trace is not None and results and not content:
+                trace.append({"provider": "OpenSubtitles", "lang": "ITA", "method": "download",
+                              "query": "", "results": len(results),
+                              "rejected": "tutti rifiutati (placeholder/invalid)"})
+            if content:
+                sync_result = validate_sync(video_path, content, sub_path)
+                if sync_result and sync_result.get("ok"):
+                    _save_sub_and_update_state(video_path, sub_path,
+                                               f"OpenSubtitles: {best.get('SubFileName', '')}", state)
+                    log.info(f"  ✅ Saved ITA (OS, sync score {sync_result['score']:.0f}): {os.path.basename(sub_path)}")
+                    return True
+                score_val = sync_result.get("score", "?") if isinstance(sync_result, dict) else "N/A"
+                log.warning(f"  OS ITA sync score too low ({score_val}), discarding")
+                if trace is not None:
+                    trace.append({"provider": "OpenSubtitles", "lang": "ITA", "method": "sync",
+                                  "query": "", "results": 1,
+                                  "rejected": f"sync score troppo basso ({score_val})"})
+        except Exception as e:
+            log.error(f"  OpenSubtitles ITA error: {e}")
+    return False
+
+
+def _try_save_eng(subdl, client, os_logged_in, video_path, en_srt_path, trace):
+    """Search ENG on Subdl then OpenSubtitles, validate sync, save .en.srt.
+    Returns True if a synced ENG sub was saved."""
+    eng_content = subdl.search_and_download(video_path, language="en", trace=trace)
+    if not eng_content and os_logged_in:
+        file_hash, file_size = compute_hash(video_path)
+        eng_content = search_and_download_english(client, video_path, file_hash, file_size, trace=trace)
+    if not eng_content:
+        return False
+
     sync_result = validate_sync(video_path, eng_content, en_srt_path)
     if not sync_result or not sync_result.get("ok"):
         score_val = sync_result.get("score", "?") if isinstance(sync_result, dict) else "N/A"
         log.warning(f"  ENG sync score too low ({score_val}), discarding")
         if trace is not None:
-            trace.append({"provider": "ENG", "lang": "ENG",
-                          "method": "sync", "query": "",
+            trace.append({"provider": "ENG", "lang": "ENG", "method": "sync", "query": "",
                           "results": 1, "rejected": f"sync score troppo basso ({score_val})"})
-        state["asked"][video_path] = {"time": datetime.now().isoformat(), "status": "failed"}
-        save_state(state)
-        if not silent:
-            trace_text = format_search_trace(trace)
-            msg = f"❌ Sub ENG trovato ma sync fallito per:\n<b>{friendly_name(video_path)}</b>"
-            if trace_text:
-                msg += f"\n\n<b>Tentativi:</b>\n{trace_text}"
-            tg_send(msg)
         return False
-    log.info(f"  Saved synced English sub (score {sync_result['score']:.0f}): {os.path.basename(en_srt_path)}")
 
-    if not translate:
-        log.info(f"  ✅ EN sub saved (translation deferred, user will decide)")
-        return "en_only"
-
-    if not CLAUDE_API_KEY:
-        log.info("  No CLAUDE_API_KEY set, skipping EN->IT translation")
-        return "en_only"
-
-    if _translate_and_save(en_srt_path, video_path, state, silent=silent, skip_sync=True):
-        return True
-
-    state["asked"][video_path] = {"time": datetime.now().isoformat(), "status": "failed"}
-    save_state(state)
-    if not silent:
-        tg_send(f"❌ Traduzione EN→IT fallita per:\n<b>{friendly_name(video_path)}</b>")
-    return False
+    log.info(f"  ✅ Saved ENG (score {sync_result['score']:.0f}): {os.path.basename(en_srt_path)}")
+    return True
 
 
 # =============================================================================

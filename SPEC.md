@@ -31,23 +31,24 @@ VIDEO FILE DISCOVERED
         |     |-- Unknown → Continue
         |
         v
-    [STEP 1: SEARCH ITA — SUBDL + OPENSUBTITLES, VALIDATE SYNC]
-        |-- Subdl ITA: Search by IMDB ID → name cascade → download
-        |     |-- validate_sync(video, content, .it.srt, min_score=800)
-        |     |-- Score OK? → DONE (fast path, zero Claude cost)
-        |     |-- Score too low? → discard, try next provider
-        |-- OpenSubtitles ITA: Hash → IMDB → name → download
-        |     |-- validate_sync → Score OK? → DONE
-        |     |-- Score too low? → discard, fall through to ENG
+    [STEP 1: TRY ITA — _try_save_ita(subdl, os_client, ...)]
+        |-- Subdl ITA → validate_sync(min_score=800) → save .it.srt if OK
+        |-- OpenSubtitles ITA → validate_sync → save .it.srt if OK
+        |-- Returns True if .it.srt was saved with a good sync
         |
         v
-    [STEP 2: ENGLISH FALLBACK — DOWNLOAD + VALIDATE SYNC]
-        |-- Subdl.com ENG search (IMDB → name)
-        |-- OpenSubtitles ENG search (hash → IMDB → name, try up to 15)
-        |-- validate_sync(video, content, .en.srt, min_score=800)
-        |-- Score OK? → save synced .en.srt → return "en_only"
-        |-- Score too low? → discard, return False (consistent with ITA path)
-        |-- Return "en_only" result if successfully synced
+    [STEP 2: ALWAYS TRY ENG TOO — _try_save_eng(...)]
+        |-- Subdl ENG → validate_sync → save .en.srt if OK
+        |-- OpenSubtitles ENG → validate_sync → save .en.srt if OK
+        |-- Returns True if .en.srt was saved with a good sync
+        |-- Runs regardless of whether ITA was found, so .en.srt is
+        |   always available as a backup / for translation later
+        |
+        v
+    [STEP 3: DECIDE OUTCOME]
+        |-- ITA saved? → return True (notify "ITA scaricato" + ENG file if also saved)
+        |-- Only ENG saved? → return "en_only" (notify "ENG salvato, tradurre?")
+        |-- Neither? → return False (notify failure with trace)
         |
         v
     [TELEGRAM: ASK USER TO TRANSLATE]
