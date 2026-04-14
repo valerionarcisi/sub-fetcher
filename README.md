@@ -87,6 +87,7 @@ docker compose up -d --build sub-fetcher
 | `/costs` | Claude API translation costs |
 | `/sync [name]` | Sync subtitles to video audio |
 | `/translate <name>` | Sync English subs (`.en.srt`, `.eng.srt`, `.english.srt`) matching `<name>` to audio, then ask to translate EN→IT |
+| `/delete <name>` | Delete all subs (IT/EN variants) for videos matching `<name>` and re-queue them for a fresh download |
 | `/cleanup` | Find and remove placeholder subtitles |
 | `/excludes` | List excluded folders |
 | `/reset` | Clear cache, rescan from scratch |
@@ -105,7 +106,7 @@ For each video, the bot tries multiple strategies in order:
 5. **OpenSubtitles.com ITA** (REST v1): Hash → IMDb ID → name → download → **validate sync** → if OK, save .it.srt
 6. *If ITA sync score too low or no ITA found* → fall through to English:
 7. **Subdl.com ENG** → **validate sync** → save `.en.srt`, ask user to translate
-8. **OpenSubtitles.com ENG** → same as above (if ENG sync fails, save unsynced anyway)
+8. **OpenSubtitles.com ENG** → same as above (if ENG sync fails, discard — consistent with ITA path)
 9. **Failure trace**: shows all attempted providers, methods, results, and OpenSubtitles download quota on Telegram
 
 ## Architecture

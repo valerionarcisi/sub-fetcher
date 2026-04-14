@@ -457,6 +457,87 @@ class TestFindEnglishSub(unittest.TestCase):
             shutil.rmtree(tmp)
 
 
+class TestOfferDelete(unittest.TestCase):
+    """offer_delete: list subs and offer confirmation."""
+
+    def test_no_matches_reports_and_exits(self):
+        from unittest.mock import patch
+        sent = []
+        with patch.object(sub_fetcher, "find_videos_by_name", return_value=[]), \
+             patch.object(sub_fetcher, "tg_send", side_effect=lambda *a, **k: sent.append(a)):
+            sub_fetcher.offer_delete("Nothing", state={})
+        self.assertTrue(any("Nessun video trovato" in str(s) for s in sent))
+
+    def test_no_subs_reports_and_exits(self):
+        from unittest.mock import patch
+        tmp = tempfile.mkdtemp()
+        try:
+            video = os.path.join(tmp, "film.mkv")
+            open(video, "w").close()
+            sent = []
+            with patch.object(sub_fetcher, "find_videos_by_name", return_value=[video]), \
+                 patch.object(sub_fetcher, "tg_send", side_effect=lambda *a, **k: sent.append(a)):
+                sub_fetcher.offer_delete("film", state={})
+            self.assertTrue(any("Nessun sub da cancellare" in str(s) for s in sent))
+        finally:
+            shutil.rmtree(tmp)
+
+    def test_offers_delete_with_buttons_when_subs_exist(self):
+        from unittest.mock import patch
+        tmp = tempfile.mkdtemp()
+        try:
+            video = os.path.join(tmp, "film.mkv")
+            it_sub = os.path.join(tmp, "film.it.srt")
+            en_sub = os.path.join(tmp, "film.en.srt")
+            open(video, "w").close()
+            open(it_sub, "w").close()
+            open(en_sub, "w").close()
+            sent = []
+            batches_store = {}
+            with patch.object(sub_fetcher, "find_videos_by_name", return_value=[video]), \
+                 patch.object(sub_fetcher, "load_batches", return_value=batches_store), \
+                 patch.object(sub_fetcher, "save_batches", side_effect=lambda b: batches_store.update(b)), \
+                 patch.object(sub_fetcher, "tg_send", side_effect=lambda *a, **k: sent.append((a, k))):
+                sub_fetcher.offer_delete("film", state={})
+            joined = str(sent)
+            self.assertIn("delete_yes", joined)
+            self.assertIn("delete_no", joined)
+            self.assertIn("film.it.srt", joined)
+            self.assertIn("film.en.srt", joined)
+            # Batch was stored
+            self.assertEqual(len(batches_store), 1)
+            stored = list(batches_store.values())[0]
+            self.assertEqual(stored["type"], "delete")
+            self.assertEqual(set(stored["subs"]), {it_sub, en_sub})
+        finally:
+            shutil.rmtree(tmp)
+
+
+class TestListVideoSubs(unittest.TestCase):
+    def test_returns_only_existing_sub_files(self):
+        tmp = tempfile.mkdtemp()
+        try:
+            video = os.path.join(tmp, "film.mkv")
+            open(video, "w").close()
+            existing = []
+            for suffix in [".it.srt", ".en.srt"]:
+                p = os.path.join(tmp, "film" + suffix)
+                open(p, "w").close()
+                existing.append(p)
+            self.assertEqual(set(sub_fetcher.list_video_subs(video)), set(existing))
+        finally:
+            shutil.rmtree(tmp)
+
+    def test_returns_empty_when_no_subs(self):
+        tmp = tempfile.mkdtemp()
+        try:
+            video = os.path.join(tmp, "film.mkv")
+            open(video, "w").close()
+            self.assertEqual(sub_fetcher.list_video_subs(video), [])
+        finally:
+            shutil.rmtree(tmp)
+
+
 class TestTranslatePrep(unittest.TestCase):
     """do_translate_prep: sync .en.srt for matches then ask the user to translate."""
 
@@ -1174,14 +1255,15 @@ class TestSyncValidationCascade(unittest.TestCase):
         )
         self.assertFalse(result)
 
-    def test_bad_ita_bad_eng_sync_still_saves_eng(self):
+    def test_bad_ita_bad_eng_sync_returns_false(self):
+        # Both ITA and ENG were found but neither synced well — discard both.
         result = self._mock_do_download(
             ita_content=b"1\n00:00:01,000 --> 00:00:02,000\nCiao\n",
             ita_sync_ok=False,
             eng_content=b"1\n00:00:01,000 --> 00:00:02,000\nHi\n",
             eng_sync_ok=False,
         )
-        self.assertEqual(result, "en_only")
+        self.assertFalse(result)
 
 
 class TestSearchTrace(unittest.TestCase):

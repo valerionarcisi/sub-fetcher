@@ -1672,18 +1672,25 @@ def do_download(video_path, state, silent=False, translate=True, trace=None):
             tg_send(msg)
         return False
 
-    # Try to sync ENG — if sync fails, save anyway (better than nothing)
+    # Validate ENG sync — discard if score too low (consistent with ITA path)
     sync_result = validate_sync(video_path, eng_content, en_srt_path)
     if not sync_result or not sync_result.get("ok"):
-        # validate_sync removed the file on failure — write it back unsyncedtry:
-        try:
-            with open(en_srt_path, "wb") as f:
-                f.write(eng_content if isinstance(eng_content, bytes) else eng_content.encode("utf-8"))
-            log.warning(f"  ENG sync failed/low score, saving unsynced: {os.path.basename(en_srt_path)}")
-        except Exception as e:
-            log.warning(f"  Failed to save English sub: {e}")
-    else:
-        log.info(f"  Saved synced English sub (score {sync_result['score']:.0f}): {os.path.basename(en_srt_path)}")
+        score_val = sync_result.get("score", "?") if isinstance(sync_result, dict) else "N/A"
+        log.warning(f"  ENG sync score too low ({score_val}), discarding")
+        if trace is not None:
+            trace.append({"provider": "ENG", "lang": "ENG",
+                          "method": "sync", "query": "",
+                          "results": 1, "rejected": f"sync score troppo basso ({score_val})"})
+        state["asked"][video_path] = {"time": datetime.now().isoformat(), "status": "failed"}
+        save_state(state)
+        if not silent:
+            trace_text = format_search_trace(trace)
+            msg = f"❌ Sub ENG trovato ma sync fallito per:\n<b>{friendly_name(video_path)}</b>"
+            if trace_text:
+                msg += f"\n\n<b>Tentativi:</b>\n{trace_text}"
+            tg_send(msg)
+        return False
+    log.info(f"  Saved synced English sub (score {sync_result['score']:.0f}): {os.path.basename(en_srt_path)}")
 
     if not translate:
         log.info(f"  ✅ EN sub saved (translation deferred, user will decide)")
@@ -1865,6 +1872,58 @@ def process_callbacks(state, excludes):
             video_path = find_path_by_hash(state, path_hash)
 
             # Handle batch callbacks
+            if action in ("delete_yes", "delete_no"):
+                state = load_state()
+                batches = load_batches()
+                batch = batches.get(path_hash)
+                if not batch:
+                    tg_answer_callback(cb_id, "⚠️ Operazione non trovata")
+                    continue
+
+                if action == "delete_no":
+                    tg_answer_callback(cb_id, "❌ Annullato")
+                    if msg_id:
+                        tg_edit_message(msg_id, "❌ Cancellazione annullata.")
+                    batches.pop(path_hash, None)
+                    save_batches(batches)
+                    continue
+
+                # delete_yes
+                deleted_files = 0
+                for sub_path in batch.get("subs", []):
+                    try:
+                        if os.path.exists(sub_path):
+                            os.remove(sub_path)
+                            deleted_files += 1
+                    except Exception as e:
+                        log.warning(f"  Failed to delete {sub_path}: {e}")
+
+                paths = batch.get("paths", [])
+                for p in paths:
+                    state["downloaded"].pop(p, None)
+                    state["asked"].pop(p, None)
+                save_state(state)
+
+                tg_answer_callback(cb_id, f"🗑 Cancellati {deleted_files} file")
+                if msg_id:
+                    tg_edit_message(msg_id,
+                        f"✅ Cancellati <b>{deleted_files}</b> file per <b>{len(paths)}</b> video.\n"
+                        f"🔄 Rimessi in coda per nuova ricerca...")
+
+                # Auto-requeue the videos for re-download
+                for p in paths:
+                    pos = queue_position()
+                    queue_msg = tg_send(
+                        f"🔍 In coda: <b>{friendly_name(p)}</b>"
+                        + (f"\n⏳ Posizione {pos + 1}" if pos > 0 else "")
+                    )
+                    queue_msg_id = queue_msg["result"]["message_id"] if queue_msg and queue_msg.get("ok") else None
+                    download_queue.put({"type": "single", "path": p, "msg_id": queue_msg_id})
+
+                batches.pop(path_hash, None)
+                save_batches(batches)
+                continue
+
             if action in ("batch_yes", "batch_no", "grp_exclude", "batch_translate", "batch_keep_en"):
                 state = load_state()
                 batches = load_batches()
@@ -2025,6 +2084,7 @@ def process_callbacks(state, excludes):
                     f"/costs — Costi traduzioni Claude\n"
                     f"/sync — Riallinea tutti i sub ITA ai video\n"
                     f"/translate &lt;nome&gt; — Sync .en.srt e chiedi se tradurre\n"
+                    f"/delete &lt;nome&gt; — Cancella sub e rimetti in coda\n"
                     f"/cleanup — Trova e rimuovi sub placeholder/VIP\n"
                     f"/excludes — Lista cartelle escluse\n"
                     f"/reset — Resetta cache (riparte da zero)\n"
@@ -2059,6 +2119,16 @@ def process_callbacks(state, excludes):
                     )
                     msg_id = result["result"]["message_id"] if result and result.get("ok") else None
                     download_queue.put({"type": "sync", "query": query, "msg_id": msg_id})
+
+            elif text.startswith("/delete"):
+                query = text[len("/delete"):].strip()
+                if not query:
+                    tg_send(
+                        "Usa: <code>/delete nome film o serie</code>\n"
+                        "Cancella i sub trovati e rimette in coda per nuova ricerca."
+                    )
+                else:
+                    offer_delete(query, state)
 
             elif text.startswith("/translate"):
                 query = text[len("/translate"):].strip()
@@ -2127,6 +2197,62 @@ def find_videos_by_name(query):
                     matches.append(full_path)
 
     return matches
+
+
+SUB_SUFFIXES_TO_DELETE = [".it.srt", ".ita.srt", ".italian.srt", ".it.hi.srt",
+                          ".en.srt", ".eng.srt", ".english.srt"]
+
+
+def list_video_subs(video_path):
+    """Return the list of subtitle file paths existing alongside a video."""
+    base = os.path.splitext(video_path)[0]
+    return [base + suffix for suffix in SUB_SUFFIXES_TO_DELETE
+            if os.path.exists(base + suffix)]
+
+
+def offer_delete(query, state):
+    """Find videos matching query, list their subs, ask for confirmation."""
+    matches = find_videos_by_name(query)
+    if not matches:
+        tg_send(f"❌ Nessun video trovato per '<b>{query}</b>'")
+        return
+
+    plan = []  # list of (video_path, [sub_paths])
+    for video in matches:
+        subs = list_video_subs(video)
+        if subs:
+            plan.append((video, subs))
+
+    if not plan:
+        tg_send(f"❌ Nessun sub da cancellare per '<b>{query}</b>'")
+        return
+
+    lines = [f"🗑 Trovati <b>{len(plan)}</b> video matching '<b>{query}</b>':\n"]
+    for video, subs in plan[:10]:
+        lines.append(f"📁 <b>{friendly_name(video)}</b>")
+        for s in subs:
+            try:
+                size_kb = os.path.getsize(s) / 1024
+                lines.append(f"   • {os.path.basename(s)} ({size_kb:.0f} KB)")
+            except Exception:
+                lines.append(f"   • {os.path.basename(s)}")
+    if len(plan) > 10:
+        lines.append(f"\n<i>… e altri {len(plan) - 10} video</i>")
+
+    delete_hash = str(abs(hash(tuple(v for v, _ in plan))))[:8]
+    batches = load_batches()
+    batches[delete_hash] = {
+        "type": "delete",
+        "paths": [v for v, _ in plan],
+        "subs": [s for _, subs in plan for s in subs],
+    }
+    save_batches(batches)
+
+    keyboard = {"inline_keyboard": [[
+        {"text": "✅ Cancella e ricerca di nuovo", "callback_data": f"delete_yes:{delete_hash}"},
+        {"text": "❌ Annulla", "callback_data": f"delete_no:{delete_hash}"},
+    ]]}
+    tg_send("\n".join(lines), reply_markup=keyboard)
 
 
 def search_and_offer(query, state):

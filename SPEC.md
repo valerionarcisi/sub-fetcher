@@ -46,8 +46,8 @@ VIDEO FILE DISCOVERED
         |-- OpenSubtitles ENG search (hash → IMDB → name, try up to 15)
         |-- validate_sync(video, content, .en.srt, min_score=800)
         |-- Score OK? → save synced .en.srt → return "en_only"
-        |-- Score too low? → save unsynced .en.srt anyway (better than nothing)
-        |-- Return "en_only" result
+        |-- Score too low? → discard, return False (consistent with ITA path)
+        |-- Return "en_only" result if successfully synced
         |
         v
     [TELEGRAM: ASK USER TO TRANSLATE]
@@ -204,6 +204,7 @@ Type any text in Telegram to search. Handles dots/underscores in filenames (e.g.
 | `/help` | Help |
 | `/sync [name]` | Sync all/matching .it.srt to video audio |
 | `/translate <name>` | For videos matching `<name>` with an English sub (`.en.srt`, `.eng.srt`, `.english.srt`) but no `.it.srt`, sync each EN sub to audio and then ask the user to confirm the EN→IT translation (Claude). Reuses the batch translate flow. |
+| `/delete <name>` | List all subtitle files (`.it.srt`, `.ita.srt`, `.en.srt`, `.eng.srt`, `.english.srt`, `.italian.srt`, `.it.hi.srt`) for videos matching `<name>` and offer a confirmation. On confirm: deletes the files, removes the videos from `state["downloaded"]` and `state["asked"]`, and re-queues each video for a fresh download. |
 | `/sub <name>` | Manual search by title |
 | `<text>` | Search for videos matching text |
 
