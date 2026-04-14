@@ -11,6 +11,7 @@ Automated Italian subtitle downloader with Telegram bot interface. Scans your me
 - **Audio sync**: ffsubsync aligns subtitles to video audio (handles different releases)
 - **Episode matching**: Ensures correct episode subtitles are downloaded (not random episodes)
 - **Italian audio detection**: Skips films already in Italian (via ffprobe)
+- **Italian-original detection**: Also skips films whose original language is Italian according to TMDb (e.g. "La Grande Bellezza"), even when the audio file has no language tags
 - **VIP placeholder rejection**: Detects and skips fake/ad subtitles from OpenSubtitles
 - **Forced sub filtering**: Rejects signs-only/forced subtitles, prefers full dialogue
 - **Telegram bot**: Grouped notifications, batch downloads with progress bar, download queue

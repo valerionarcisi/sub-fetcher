@@ -120,9 +120,10 @@ def load_state():
         except Exception:
             pass
     return {
-        "asked": {},       # path -> {"time": iso, "status": "pending"|"yes"|"no"|"failed"}
-        "downloaded": {},  # path -> {"sub": filename, "time": iso}
-        "last_offset": 0,  # Telegram update offset
+        "asked": {},              # path -> {"time": iso, "status": "pending"|"yes"|"no"|"failed"}
+        "downloaded": {},         # path -> {"sub": filename, "time": iso}
+        "italian_original": {},   # path -> {"time": iso} (cache for TMDb original_language=it)
+        "last_offset": 0,         # Telegram update offset
     }
 
 
@@ -392,6 +393,47 @@ def tmdb_find_imdb_id(title, year=None, is_tv=False):
     return None
 
 
+def tmdb_get_original_language(title, year=None, is_tv=False):
+    """Return the original_language ISO-639-1 code from TMDb (e.g. 'it', 'en'),
+    or None if the lookup fails. Uses the first search result, like
+    tmdb_find_imdb_id."""
+    if not TMDB_API_KEY or not title:
+        return None
+    endpoint = "/search/tv" if is_tv else "/search/movie"
+    params = {"api_key": TMDB_API_KEY, "query": title, "include_adult": "false"}
+    if year and not is_tv:
+        params["year"] = str(year)
+    elif year and is_tv:
+        params["first_air_date_year"] = str(year)
+    url = f"{TMDB_API_URL}{endpoint}?{urllib.parse.urlencode(params)}"
+    try:
+        with urllib.request.urlopen(url, timeout=10) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except Exception as e:
+        log.warning(f"  TMDb language lookup error: {e}")
+        return None
+    results = data.get("results") or []
+    if not results:
+        return None
+    lang = results[0].get("original_language")
+    if lang:
+        log.debug(f"  TMDb original_language for '{title}' ({year}): {lang}")
+    return lang
+
+
+def is_italian_original(video_path):
+    """Return True if TMDb says this film/series was made in Italian.
+    Used to skip the subtitle search for Italian-original content (e.g.
+    'La Grande Bellezza') even when the file lacks proper audio language
+    tags. Falls back to False if TMDb can't resolve it."""
+    parsed = parse_video(video_path)
+    if not parsed.get("name"):
+        return False
+    is_tv = parsed.get("type") == "episode"
+    lang = tmdb_get_original_language(parsed["name"], parsed.get("year"), is_tv=is_tv)
+    return lang == "it"
+
+
 def find_imdb_id(video_path):
     """Find IMDb ID from .nfo files first, fall back to TMDb lookup."""
     imdb = _find_imdb_id_from_nfo(video_path)
@@ -593,6 +635,10 @@ def scan_missing(state, excludes):
                     log.info(f"  Skipping (Italian audio): {fname}")
                     continue
 
+                # Cached "Italian original via TMDb" — set on first detection.
+                if full_path in state.get("italian_original", {}):
+                    continue
+
                 # Check state
                 info = state["asked"].get(full_path)
                 if info:
@@ -607,6 +653,16 @@ def scan_missing(state, excludes):
 
                 if full_path in state["downloaded"]:
                     continue  # Already downloaded
+
+                # New video — check TMDb for Italian original_language.
+                # Cached afterwards so we don't re-query at every scan.
+                if is_italian_original(full_path):
+                    log.info(f"  Skipping (Italian original via TMDb): {fname}")
+                    state.setdefault("italian_original", {})[full_path] = {
+                        "time": datetime.now().isoformat(),
+                    }
+                    save_state(state)
+                    continue
 
                 missing.append(full_path)
 

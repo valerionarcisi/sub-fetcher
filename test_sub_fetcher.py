@@ -400,6 +400,84 @@ class TestTmdbLookup(unittest.TestCase):
             sub_fetcher.TMDB_API_KEY = original
 
 
+class TestItalianOriginalDetection(unittest.TestCase):
+    """tmdb_get_original_language and is_italian_original."""
+
+    def _mock_tmdb_search(self, original_language):
+        from unittest.mock import MagicMock
+        resp = MagicMock()
+        resp.read.return_value = json.dumps(
+            {"results": [{"id": 1, "original_language": original_language}]}
+        ).encode()
+        resp.__enter__ = lambda s: s
+        resp.__exit__ = lambda *a: None
+        return resp
+
+    def test_get_original_language_returns_it(self):
+        from unittest.mock import patch
+        original = sub_fetcher.TMDB_API_KEY
+        sub_fetcher.TMDB_API_KEY = "fake"
+        try:
+            with patch("urllib.request.urlopen",
+                       return_value=self._mock_tmdb_search("it")):
+                lang = sub_fetcher.tmdb_get_original_language("La Grande Bellezza", 2013)
+            self.assertEqual(lang, "it")
+        finally:
+            sub_fetcher.TMDB_API_KEY = original
+
+    def test_get_original_language_returns_none_without_key(self):
+        original = sub_fetcher.TMDB_API_KEY
+        sub_fetcher.TMDB_API_KEY = ""
+        try:
+            self.assertIsNone(sub_fetcher.tmdb_get_original_language("X", 2020))
+        finally:
+            sub_fetcher.TMDB_API_KEY = original
+
+    def test_is_italian_original_true_for_italian_film(self):
+        from unittest.mock import patch
+        with patch.object(sub_fetcher, "tmdb_get_original_language", return_value="it"):
+            self.assertTrue(
+                sub_fetcher.is_italian_original("/media/films/La Grande Bellezza (2013)/film.mkv")
+            )
+
+    def test_is_italian_original_false_for_english_film(self):
+        from unittest.mock import patch
+        with patch.object(sub_fetcher, "tmdb_get_original_language", return_value="en"):
+            self.assertFalse(
+                sub_fetcher.is_italian_original("/media/films/Punch-Drunk Love (2002)/film.mkv")
+            )
+
+    def test_is_italian_original_false_when_tmdb_unknown(self):
+        from unittest.mock import patch
+        with patch.object(sub_fetcher, "tmdb_get_original_language", return_value=None):
+            self.assertFalse(
+                sub_fetcher.is_italian_original("/media/films/Random Movie (2020)/film.mkv")
+            )
+
+    def test_scan_missing_skips_italian_originals_and_caches(self):
+        from unittest.mock import patch
+        tmp = tempfile.mkdtemp()
+        try:
+            italian_dir = os.path.join(tmp, "La Grande Bellezza (2013)")
+            os.makedirs(italian_dir)
+            video = os.path.join(italian_dir, "La Grande Bellezza.mkv")
+            open(video, "w").close()
+
+            state = {"asked": {}, "downloaded": {}, "italian_original": {}}
+
+            with patch.object(sub_fetcher, "FILMS_PATH", tmp), \
+                 patch.object(sub_fetcher, "SERIES_PATH", "/nonexistent"), \
+                 patch.object(sub_fetcher, "has_italian_audio", return_value=False), \
+                 patch.object(sub_fetcher, "is_italian_original", return_value=True), \
+                 patch.object(sub_fetcher, "save_state"):
+                missing = sub_fetcher.scan_missing(state, excludes=set())
+            self.assertEqual(missing, [], "Italian-original film must not be in missing list")
+            self.assertIn(video, state["italian_original"],
+                "Italian-original detection should be cached in state")
+        finally:
+            shutil.rmtree(tmp)
+
+
 class TestFindEnglishSub(unittest.TestCase):
     def test_finds_en_srt(self):
         tmp = tempfile.mkdtemp()

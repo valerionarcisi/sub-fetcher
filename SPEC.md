@@ -10,7 +10,9 @@ VIDEO FILE DISCOVERED
         |-- Has .it.srt / .it.hi.srt already? → SKIP
         |-- Folder in exclude list? → SKIP
         |-- Italian audio track (ffprobe)? → SKIP (e.g. "La Battaglia di Algeri")
+        |-- Cached as Italian-original (state["italian_original"])? → SKIP
         |-- Already asked/downloaded/failed (within cooldown)? → SKIP
+        |-- TMDb original_language="it"? → SKIP + cache (e.g. "La Grande Bellezza")
         |
         v
     [AUTO-ENQUEUE FOR DOWNLOAD]
@@ -94,6 +96,9 @@ VIDEO FILE DISCOVERED
 
 ### Italian Audio Detection (`has_italian_audio`)
 Uses `ffprobe` to inspect audio stream metadata. Checks `language` tag for "ita"/"it"/"italian" and `title` tag for Italian keywords. Videos with Italian audio are skipped (no need for Italian subtitles).
+
+### Italian-Original Detection (`is_italian_original`)
+Complementary check that handles Italian-original films whose audio metadata lacks proper language tags (e.g. badly muxed downloads of "La Grande Bellezza"). Calls `tmdb_get_original_language(title, year)` and skips the file if TMDb reports `original_language="it"`. Result is cached in `state["italian_original"]` so subsequent scans don't re-query TMDb. Runs after `has_italian_audio` and after the state checks, so only NEW videos pay the API cost — and only once per file.
 
 ### Sync Validation (`validate_sync`)
 Writes subtitle content to a temp path, syncs it via `sync_subtitle(min_score=SYNC_MIN_SCORE)`, and validates the score. If the score is too low (< 800 by default), removes the file and returns `{"ok": False, ...}`. This is the gate that decides whether an ITA sub is good enough to save or should be discarded in favour of an ENG fallback.
