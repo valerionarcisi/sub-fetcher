@@ -1,5 +1,7 @@
 # State and config (contain tokens/credentials)
 state.json
+batches.json
+requests.json
 exclude_folders.txt
 
 # Logs

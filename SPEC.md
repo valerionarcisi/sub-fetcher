@@ -292,3 +292,150 @@ Keep the last N downloaded subtitle paths in a ring buffer. `/undo` deletes the 
 
 ### Subtitle quality score in notifications
 When multiple candidates exist, show the chosen one's score and provider in the success message (e.g. `✅ Punch-Drunk Love — Subdl (score: 780)`). Makes it easier to spot low-confidence matches that may need `/sync` or manual review.
+
+
+---
+
+## Proposal: request a new film from Telegram (`/scarica`)
+
+### Goal
+Today the bot only reacts to videos that **already exist** under `/media/films` and `/media/series`. The user wants a Telegram-driven way to **request a film the library does not yet have**, kicking off the standard *arr download flow without leaving the chat. The subtitle pipeline then triggers automatically once the file lands on disk.
+
+### User flow
+Two-step manual selection: first the **film**, then the **release**. We never let Radarr auto-grab — the user decides.
+
+```
+User:  /scarica Punch-Drunk Love
+        ↓
+Bot:   Search TMDb for title (+ optional year)
+        ↓
+Bot:   Step 1 — film disambiguation (inline buttons, top 5)
+       [ 🎬 Punch-Drunk Love (2002) — EN · Paul Thomas Anderson ]
+       [ 🎬 Punch-Drunk Knuckle (2015) — EN ]
+       [ ❌ Annulla ]
+        ↓
+User:  Taps the right one
+        ↓
+Bot:   POST /api/v3/movie with monitored=true, searchForMovie=false
+       (we add it to Radarr but do NOT auto-grab — we want the release list)
+        ↓
+Bot:   GET /api/v3/release?movieId=<id>   ← "Interactive Search"
+        ↓
+Bot:   Step 2 — release list (top 8, sorted by quality+seeders, paged if needed)
+       Each row: quality · size · language · indexer · seeders
+       
+       🇮🇹 2160p · 18.4 GB · ITA+ENG · BHD · 142↑
+       🇮🇹 1080p · 9.1 GB · ITA      · iTorrents · 88↑
+       🇬🇧 1080p · 7.8 GB · ENG      · BHD · 220↑
+       🇬🇧 720p  · 3.2 GB · ENG      · TorrentDay · 41↑
+       […8 rows + Avanti/Indietro buttons]
+       [ ❌ Annulla ]
+        ↓
+User:  Taps a release
+        ↓
+Bot:   Confirmation card (poster + full release name + size + indexer + grab button)
+       [ ⬇️ Conferma grab ]  [ ↩️ Cambia release ]
+        ↓
+User:  Conferma
+        ↓
+Bot:   POST /api/v3/release  { guid, indexerId }
+        ↓
+Bot:   "📥 In download via <indexer>. Ti avviso quando arriva il file + sub ITA."
+        ↓
+        (existing sub-fetcher scan picks up the .mkv when the *arr stack finishes,
+         the normal subtitle download / translation flow runs)
+        ↓
+Bot:   "✅ Pronto: Punch-Drunk Love (2002) — sub ITA scaricato"
+```
+
+### Scope
+**In scope**
+- Films only (Radarr). Series via Sonarr can be a second iteration.
+- TMDb-driven disambiguation (already integrated for IMDb-id resolution).
+- Inline-button selection of the match — no free-text disambiguation.
+- One Radarr profile / root folder, configured via env vars.
+- No quality / release-group choices: trust Radarr's default profile.
+
+**Out of scope**
+- Listing / cancelling pending Radarr requests from Telegram (use Radarr UI).
+- Authentication / multi-user. The bot already trusts `TELEGRAM_CHAT_ID`.
+- Mapping the eventual download back to a specific Telegram message ID (the sub-fetcher's existing scan-and-notify is good enough).
+
+### New components
+1. **`RadarrClient`** — minimal wrapper around Radarr v3 REST API:
+   - `lookup(tmdb_id) -> dict` (`/movie/lookup/tmdb?tmdbId=...`) — validates the film and checks if it's already added.
+   - `add(tmdb_id, quality_profile_id, root_folder_path) -> int` — POST `/movie` with `monitored=true, addOptions.searchForMovie=false` (we want the release list, not auto-grab). Returns the new `movieId`. Handles 409 (already exists) by re-fetching the existing movieId.
+   - `releases(movie_id) -> list[Release]` — GET `/release?movieId=<id>`. Triggers Radarr's Interactive Search across all configured indexers and returns the deduplicated list. Each entry exposes: `guid`, `indexerId`, `indexer` (display name), `title` (release name), `size` (bytes), `seeders`, `leechers`, `quality.quality.name` (e.g. "Bluray-1080p"), `languages` (list of `{id, name}`), `rejections` (list — Radarr's reasons not to grab, e.g. "Already imported"). Surface rejections to the user as warning badges, don't filter them out.
+   - `grab(guid, indexer_id) -> dict` — POST `/release` with the chosen guid + indexerId. Radarr forwards to the download client.
+
+2. **Release ranking & formatting** (sub-fetcher side):
+   - Sort by: (a) preferred-language matches first, (b) quality tier (2160p > 1080p > 720p), (c) seeders desc.
+   - Detect language from `release.languages` first; fall back to substring match on the release title (`ITA`, `ITALIAN`, `iTALiAN`, `ENG`, `MULTI`). Show flag emoji per inferred language.
+   - Truncate the release name to ~80 chars for the inline-button label (Telegram limits button text length); the **full** release name is shown in the confirmation card on the next step.
+   - Paginate with Avanti / Indietro buttons (8 per page).
+
+3. **TMDb search** — extend the existing TMDb helper with `search_movies(query) -> [{tmdb_id, title, year, original_language, overview, poster_url}]`. We already call `/search/movie` for IMDb resolution; just expose the multi-result form.
+
+4. **New command `/scarica <title>`** (alias `/download`, `/req`) wired into the existing command registry.
+
+5. **New callback handlers**:
+   - `radarr_pick:<film_hash>` — step-1 selection (which TMDb film).
+   - `radarr_rel:<release_hash>` — step-2 selection (which release).
+   - `radarr_page:<film_hash>:<n>` — release list pagination.
+   - `radarr_grab:<release_hash>` — final confirmation.
+   - `radarr_cancel:<hash>` — abort at any step.
+
+6. **Optional v2**: Radarr webhook → small HTTP listener so we can notify "📥 download partito / completato" without waiting for the next filesystem scan.
+
+### State changes
+- New file `requests.json` (separate from `state.json` to keep concerns clean — survives `/reset` since the user wouldn't expect a "Pronto" notification to be lost):
+  ```json
+  {
+    "pending_radarr": {
+      "<tmdb_id>": {
+        "title": "Punch-Drunk Love",
+        "year": 2002,
+        "requested_at": "2026-05-13T17:00:00",
+        "telegram_msg_id": 12345,
+        "movie_id": 4231,
+        "release": {"title": "...", "indexer": "BHD", "size_gb": 18.4, "language": "ITA"}
+      }
+    }
+  }
+  ```
+- Short-lived `batches.json` entries hold the release list between step-1 and step-2 (keyed by `film_hash`), so the user can paginate / change release without re-querying Radarr.
+- When `do_download` finds a new file under `/media/films`, after a successful subtitle save it checks `pending_radarr` for a matching title+year and clears the entry with a "📬 Pronto" notification.
+
+### Configuration (new env vars)
+| Variable | Required | Default | Description |
+|---|---|---|---|
+| `RADARR_URL` | Yes | — | e.g. `http://radarr:7878` |
+| `RADARR_API_KEY` | Yes | — | from Radarr → Settings → General |
+| `RADARR_ROOT_FOLDER` | No | first folder from `/rootFolder` | absolute path where Radarr writes films |
+| `RADARR_QUALITY_PROFILE` | No | first profile from `/qualityprofile` | quality profile id or name — note: profile gates only **what shows up** in the release list. With Interactive Search the user can still grab outside the profile. |
+| `RADARR_PREFERRED_LANGUAGES` | No | `ITA,ENG` | sort hint for the release picker |
+| `TMDB_API_KEY` | Yes | — | already used; required for search |
+
+### Error handling
+- Radarr unreachable → "❌ Radarr non raggiungibile (RADARR_URL=...)". No retry; user re-tries.
+- TMDb returns no results → "❌ Nessun film trovato per '<query>'. Prova con titolo + anno."
+- Film already in Radarr (409) → re-use the existing `movieId` and proceed straight to the release list.
+- Interactive Search returns 0 releases → "⚠️ Nessun rilascio trovato sugli indexer configurati. Riprova più tardi o controlla la profile in Radarr."
+- All releases have `rejections` → still show them (with a 🚫 badge per row), but warn at the top.
+- Radarr root folder / profile missing → log + Telegram error with the exact field. Fail loud.
+
+### Why this fits the current architecture
+- The bot already wraps a few HTTP APIs (Subdl, OpenSubtitles, TMDb, Claude, DeepL) — Radarr is just another. Same `urllib.request` style.
+- The post-download trigger needs **no new logic**: the existing `scan_missing` loop already picks up new files. We just decorate the existing success notification with the "previously-requested via Telegram" context.
+- The Telegram command registry just gained an alias system — `/scarica` slots in as one more entry.
+
+### Open questions (decide before implementing)
+1. **Sonarr (series) in the same iteration, or split?** Sonarr's add-series payload is more complex (seasons, monitoring profile). I'd ship films first.
+2. **Interactive Search timeout.** Radarr queries every indexer sequentially — can take 10-30s on a sparse search. Show a "🔎 Sto chiedendo agli indexer…" placeholder before the release list, and edit-in-place when results arrive.
+3. **Release list page size.** 8 per page (Telegram inline-button rows render well, message stays readable). Bigger pages risk the 4096-char limit + 100-button limit.
+4. **What if Radarr already has a downloaded file for that film?** `lookup` exposes `hasFile=true`. Skip the flow and tell the user "ℹ️ Già scaricato in <path>". Optionally offer `/cancella` to wipe subs + re-queue.
+5. **Where does the "📬 ready" notification fire?** From `do_download`'s success path checking `pending_radarr`, vs. a Radarr webhook listener. Webhook is cleaner but adds an HTTP server. State-file polling is dumber but zero ops.
+
+### Estimated complexity
+- ~400 lines: `RadarrClient` with release support (~140), TMDb multi-search (~30), command + 5 callbacks + pagination (~140), state plumbing (~50), tests (~40 cases).
+- ~3-4 hours of focused work, mostly Radarr-side configuration and end-to-end testing on a real install with at least one configured indexer.

@@ -1821,5 +1821,268 @@ class TestBatchTranslatePersistence(unittest.TestCase):
         self.assertIn("def", loaded)
 
 
+class TestClaudeBisectFallback(unittest.TestCase):
+    """Verify the Claude fallback recovers from truncation/missing cues by
+    bisecting the batch instead of silently leaving cues in English."""
+
+    def _make_response(self, translations, stop_reason="end_turn"):
+        """Build a fake Claude API response body."""
+        text = "\n".join(f"[{i}] {v}" for i, v in translations.items())
+        return {
+            "content": [{"type": "text", "text": text}],
+            "usage": {"input_tokens": 100, "output_tokens": 50},
+            "stop_reason": stop_reason,
+        }
+
+    def test_all_cues_translated_no_retry(self):
+        """Happy path: model returns translations for every asked-for index."""
+        indexed = [(0, "Hello"), (1, "World"), (2, "Bye")]
+        responses = iter([self._make_response({0: "Ciao", 1: "Mondo", 2: "Addio"})])
+        calls = []
+
+        def fake_call(itxts, vname):
+            calls.append(list(itxts))
+            r = next(responses)
+            return {"translations": {i: t for i, t in zip([x[0] for x in itxts], ["Ciao", "Mondo", "Addio"])},
+                    "input_tokens": 100, "output_tokens": 50, "truncated": False, "ok": True}
+
+        orig = sub_fetcher._claude_translate_call
+        sub_fetcher._claude_translate_call = fake_call
+        try:
+            result = sub_fetcher._claude_translate_bisect(indexed, "Test")
+        finally:
+            sub_fetcher._claude_translate_call = orig
+
+        self.assertEqual(result["translations"], {0: "Ciao", 1: "Mondo", 2: "Addio"})
+        self.assertEqual(len(calls), 1)  # No retry needed
+
+    def test_truncated_response_triggers_bisect(self):
+        """When Claude truncates and drops the last cue, the batch must split
+        and retry the missing one."""
+        calls = []
+
+        def fake_call(itxts, vname):
+            calls.append([i for i, _ in itxts])
+            asked = [i for i, _ in itxts]
+            if len(asked) == 4:
+                # First call: returns 3 of 4 (truncated dropped the last)
+                return {"translations": {0: "A", 1: "B", 2: "C"},
+                        "input_tokens": 100, "output_tokens": 8192, "truncated": True, "ok": True}
+            else:
+                # Retry for the missing cue (3)
+                return {"translations": {i: f"v{i}" for i in asked},
+                        "input_tokens": 30, "output_tokens": 30, "truncated": False, "ok": True}
+
+        orig = sub_fetcher._claude_translate_call
+        sub_fetcher._claude_translate_call = fake_call
+        try:
+            result = sub_fetcher._claude_translate_bisect(
+                [(0, "a"), (1, "b"), (2, "c"), (3, "d")], "Test")
+        finally:
+            sub_fetcher._claude_translate_call = orig
+
+        # All 4 cues must be present in the final translation.
+        self.assertEqual(set(result["translations"].keys()), {0, 1, 2, 3})
+        # First call asked for all 4; subsequent calls retried just cue 3.
+        self.assertEqual(calls[0], [0, 1, 2, 3])
+        self.assertTrue(any(3 in c for c in calls[1:]))
+
+    def test_persistent_single_cue_failure_keeps_en(self):
+        """Single-cue retry that still fails returns no translation for that
+        cue — caller falls back to EN. No infinite recursion."""
+        def fake_call(itxts, vname):
+            # Always returns empty translations regardless of input.
+            return {"translations": {}, "input_tokens": 10, "output_tokens": 0,
+                    "truncated": False, "ok": True}
+
+        orig = sub_fetcher._claude_translate_call
+        sub_fetcher._claude_translate_call = fake_call
+        try:
+            result = sub_fetcher._claude_translate_bisect([(0, "stubborn cue")], "Test")
+        finally:
+            sub_fetcher._claude_translate_call = orig
+
+        self.assertEqual(result["translations"], {})
+
+    def test_hallucinated_index_is_rejected(self):
+        """Claude returning [99] when we asked for [0..3] must not pollute the
+        translation map."""
+        # Use the real _claude_translate_call wired to a urlopen mock.
+        original_urlopen = urllib.request.urlopen
+
+        class FakeResponse:
+            def __init__(self, body):
+                self._body = body
+            def __enter__(self): return self
+            def __exit__(self, *a): pass
+            def read(self): return json.dumps(self._body).encode("utf-8")
+
+        def fake_urlopen(req, timeout=None):
+            return FakeResponse({
+                "content": [{"type": "text", "text": "[0] Zero\n[1] One\n[99] hallucinated\n"}],
+                "usage": {"input_tokens": 10, "output_tokens": 10},
+                "stop_reason": "end_turn",
+            })
+
+        urllib.request.urlopen = fake_urlopen
+        # _claude_translate_call requires CLAUDE_API_KEY to be truthy to send.
+        prev_key = sub_fetcher.CLAUDE_API_KEY
+        sub_fetcher.CLAUDE_API_KEY = "test"
+        try:
+            result = sub_fetcher._claude_translate_call([(0, "a"), (1, "b")], "Test")
+        finally:
+            urllib.request.urlopen = original_urlopen
+            sub_fetcher.CLAUDE_API_KEY = prev_key
+
+        # Only asked-for indices survive.
+        self.assertEqual(set(result["translations"].keys()), {0, 1})
+        self.assertEqual(result["translations"][0], "Zero")
+        self.assertEqual(result["translations"][1], "One")
+
+
+class TestRadarrReleaseParsing(unittest.TestCase):
+    """Verify language detection and ranking on synthetic Radarr release payloads."""
+
+    def test_detects_ita_from_structured_languages(self):
+        rel = {"title": "Movie.2024.1080p.x265", "languages": [{"id": 5, "name": "Italian"}]}
+        self.assertIn("ITA", sub_fetcher.detect_release_languages(rel))
+
+    def test_detects_eng_from_structured_languages(self):
+        rel = {"title": "Movie.2024.1080p.x265", "languages": [{"id": 1, "name": "English"}]}
+        self.assertIn("ENG", sub_fetcher.detect_release_languages(rel))
+
+    def test_detects_ita_from_title_substring(self):
+        rel = {"title": "Movie.2024.iTALiAN.1080p.WEBRip.x265.mkv", "languages": []}
+        self.assertIn("ITA", sub_fetcher.detect_release_languages(rel))
+
+    def test_detects_multi_release(self):
+        rel = {"title": "Movie.2024.MULTi.2160p.UHD.BluRay.x265.mkv", "languages": []}
+        self.assertIn("MULTI", sub_fetcher.detect_release_languages(rel))
+
+    def test_no_false_positive_eng_inside_word(self):
+        # "ENGAGE" must not match "ENG" because of the word boundary.
+        rel = {"title": "Engage.With.The.Aliens.2024.1080p.mkv", "languages": []}
+        self.assertNotIn("ENG", sub_fetcher.detect_release_languages(rel))
+
+    def test_unknown_language_fallback(self):
+        rel = {"title": "Random.Movie.2024.x265", "languages": []}
+        self.assertEqual(sub_fetcher.detect_release_languages(rel), ["?"])
+
+    def test_rank_prefers_preferred_language_then_quality(self):
+        ita_720 = {"title": "ITA.720p", "languages": [{"name": "Italian"}], "size": 1, "seeders": 10,
+                   "quality": {"quality": {"name": "HDTV-720p"}}}
+        eng_2160 = {"title": "ENG.2160p", "languages": [{"name": "English"}], "size": 1, "seeders": 100,
+                    "quality": {"quality": {"name": "Bluray-2160p"}}}
+        ita_1080 = {"title": "ITA.1080p", "languages": [{"name": "Italian"}], "size": 1, "seeders": 5,
+                    "quality": {"quality": {"name": "Bluray-1080p"}}}
+        ranked = sub_fetcher.rank_releases([eng_2160, ita_720, ita_1080], preferred=["ITA", "ENG"])
+        # ITA must come before ENG even at higher quality; among ITA, 1080p > 720p.
+        self.assertEqual(ranked[0]["title"], "ITA.1080p")
+        self.assertEqual(ranked[1]["title"], "ITA.720p")
+        self.assertEqual(ranked[2]["title"], "ENG.2160p")
+
+    def test_rank_uses_seeders_as_tiebreaker(self):
+        a = {"title": "A", "languages": [{"name": "Italian"}], "size": 1, "seeders": 5,
+             "quality": {"quality": {"name": "Bluray-1080p"}}}
+        b = {"title": "B", "languages": [{"name": "Italian"}], "size": 1, "seeders": 200,
+             "quality": {"quality": {"name": "Bluray-1080p"}}}
+        ranked = sub_fetcher.rank_releases([a, b], preferred=["ITA"])
+        self.assertEqual(ranked[0]["title"], "B")
+
+    def test_format_release_button_keeps_under_telegram_limit(self):
+        rel = {"title": "Some.Very.Long.Release.Title.That.Goes.On.Forever.2160p.UHD.BluRay.x265.HDR.DV.Atmos-GROUP",
+               "languages": [{"name": "Italian"}],
+               "quality": {"quality": {"name": "Bluray-2160p"}},
+               "size": 18_400_000_000, "seeders": 142, "leechers": 3, "rejections": []}
+        label = sub_fetcher.format_release_button(rel)
+        self.assertLessEqual(len(label), 80)
+        self.assertIn("🇮🇹", label)
+        self.assertIn("2160p", label)
+        self.assertIn("GB", label)
+
+    def test_format_release_button_marks_rejections(self):
+        rel = {"title": "Foo", "languages": [{"name": "English"}],
+               "quality": {"quality": {"name": "Bluray-1080p"}},
+               "size": 1_000_000_000, "seeders": 10, "rejections": ["Already imported"]}
+        label = sub_fetcher.format_release_button(rel)
+        self.assertTrue(label.startswith("🚫"))
+
+
+class TestRadarrRequestsState(unittest.TestCase):
+    """Ensure requests.json round-trips cleanly and is decoupled from state.json."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self._orig = sub_fetcher.REQUESTS_FILE
+        sub_fetcher.REQUESTS_FILE = os.path.join(self.tmpdir, "requests.json")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir)
+        sub_fetcher.REQUESTS_FILE = self._orig
+
+    def test_save_load_round_trip(self):
+        rs = sub_fetcher.load_requests()
+        rs["pending_radarr"]["download:123"] = {"title": "Foo", "year": 2024}
+        sub_fetcher.save_requests(rs)
+        loaded = sub_fetcher.load_requests()
+        self.assertEqual(loaded["pending_radarr"]["download:123"]["title"], "Foo")
+
+    def test_missing_file_returns_empty_pending(self):
+        rs = sub_fetcher.load_requests()
+        self.assertEqual(rs, {"pending_radarr": {}})
+
+
+class TestCommandDispatcher(unittest.TestCase):
+    """Verify the alias registry resolves all known aliases and falls back to
+    'did you mean?' for typos."""
+
+    def test_canonical_lookup(self):
+        for canonical in ["/stato", "/traduci", "/ritraduci", "/coda", "/log", "/falliti", "/scarica", "/aiuto"]:
+            spec = sub_fetcher._find_command(canonical)
+            self.assertIsNotNone(spec, f"canonical {canonical} should resolve")
+            self.assertEqual(spec["canonical"], canonical)
+
+    def test_alias_lookup(self):
+        aliases = {
+            "/status": "/stato",
+            "/st": "/stato",
+            "/translate": "/traduci",
+            "/t": "/traduci",
+            "/rt": "/ritraduci",
+            "/del": "/cancella",
+            "/queue": "/coda",
+            "/q": "/coda",
+            "/failed": "/falliti",
+            "/help": "/aiuto",
+            "/?": "/aiuto",
+        }
+        for alias, expected_canonical in aliases.items():
+            spec = sub_fetcher._find_command(alias)
+            self.assertIsNotNone(spec, f"alias {alias} should resolve")
+            self.assertEqual(spec["canonical"], expected_canonical)
+
+    def test_unknown_returns_none(self):
+        self.assertIsNone(sub_fetcher._find_command("/notacommand"))
+
+    def test_suggest_close_typo(self):
+        # "/staus" is closest to the alias "/status" (insert 't'); both /status
+        # and /stato map to the same handler, so any close hit is good UX.
+        suggestion = sub_fetcher._suggest_command("/staus")
+        self.assertIn(suggestion, ["/status", "/stato"])
+        # "/coa" is closest to "/coda"
+        self.assertEqual(sub_fetcher._suggest_command("/coa"), "/coda")
+
+    def test_suggest_too_far(self):
+        self.assertIsNone(sub_fetcher._suggest_command("/zzzzzzzzz"))
+
+    def test_no_duplicate_aliases(self):
+        seen = {}
+        for c in sub_fetcher.COMMANDS:
+            for form in [c["canonical"]] + c["aliases"]:
+                self.assertNotIn(form, seen,
+                    f"alias {form} appears in both {seen.get(form)} and {c['canonical']}")
+                seen[form] = c["canonical"]
+
+
 if __name__ == "__main__":
     unittest.main()

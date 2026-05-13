@@ -7,7 +7,7 @@ Automated Italian subtitle downloader with Telegram bot interface. Scans your me
 - **Multi-provider search**: Subdl.com (primary) + OpenSubtitles.com REST v1 (fallback)
 - **TMDb lookup**: resolves IMDb ID from title + year when no `.nfo` file is present, so search runs on a canonical ID instead of a dirty filename
 - **Two-phase download**: EN subs downloaded for free, translation is optional and cost-estimated upfront
-- **AI translation**: English → Italian via Claude API with cost estimate before confirmation
+- **AI translation**: English → Italian via DeepL (primary, cue-by-cue, no truncation) with optional Claude polish pass to rewrite unnatural lines. Falls back to full Claude translation if DeepL is unavailable.
 - **Audio sync**: ffsubsync aligns subtitles to video audio (handles different releases)
 - **Episode matching**: Ensures correct episode subtitles are downloaded (not random episodes)
 - **Italian audio detection**: Skips films already in Italian (via ffprobe)
@@ -16,7 +16,7 @@ Automated Italian subtitle downloader with Telegram bot interface. Scans your me
 - **Forced sub filtering**: Rejects signs-only/forced subtitles, prefers full dialogue
 - **Telegram bot**: Grouped notifications, batch downloads with progress bar, download queue
 - **Dual save**: Keeps both `.en.srt` (synced) and `.it.srt` when translating
-- **Cost tracking**: Tracks Claude API usage and costs, shows estimate before translating
+- **Cost tracking**: Tracks DeepL character usage and Claude API token costs, shows estimate before translating
 
 ## How It Works
 
@@ -47,7 +47,9 @@ Phase 2 (PAID, user confirms):
 - **Subdl.com**: Register at [subdl.com](https://subdl.com) for a free API key
 - **OpenSubtitles.com** (recommended): Register at [opensubtitles.com](https://www.opensubtitles.com), then create an API consumer at `/en/consumers` with `dev_mode` enabled (100 downloads/day free). Copy the API key.
 - **TMDb** (recommended): Register at [themoviedb.org](https://www.themoviedb.org/settings/api), request a Developer key (free, unlimited). Used to resolve IMDb IDs from title + year.
-- **Claude API** (optional): Get from [console.anthropic.com](https://console.anthropic.com)
+- **DeepL API** (recommended for translation): Register at [deepl.com/pro-api](https://www.deepl.com/pro-api) — Free tier gives 500k chars/month (≈10 films). Key ends with `:fx` for free, plain for paid.
+- **Claude API** (optional): Get from [console.anthropic.com](https://console.anthropic.com). Used as fallback if DeepL is missing, and (with Haiku 4.5) to polish unnatural lines in DeepL output.
+- **Radarr** (optional, enables `/scarica`): point at your existing Radarr v3 instance. Required env vars: `RADARR_URL` (e.g. `http://radarr:7878`) + `RADARR_API_KEY` (Settings → General).
 
 ### 2. Docker Compose
 
@@ -70,7 +72,12 @@ sub-fetcher:
     - SUBDL_API_KEY=your_subdl_key
     - OPENSUBTITLES_API_KEY=your_opensubtitles_consumer_key   # recommended
     - TMDB_API_KEY=your_tmdb_v3_api_key                       # recommended
-    - CLAUDE_API_KEY=your_claude_key                          # optional
+    - DEEPL_API_KEY=your_deepl_key                            # recommended (free tier OK)
+    - CLAUDE_API_KEY=your_claude_key                          # optional (polish + fallback)
+    - POLISH_TRANSLATION=true                                 # optional, default true
+    - RADARR_URL=http://radarr:7878                           # optional, enables /scarica
+    - RADARR_API_KEY=your_radarr_key                          # optional, enables /scarica
+    - RADARR_PREFERRED_LANGUAGES=ITA,ENG                      # optional, default ITA,ENG
 ```
 
 ### 3. Run
@@ -81,20 +88,37 @@ docker compose up -d --build sub-fetcher
 
 ## Telegram Commands
 
-| Command | Description |
-|---|---|
-| `/status` | Current state (pending/downloaded/failed) |
-| `/scan` | Force a manual scan |
-| `/costs` | Claude API translation costs |
-| `/sync [name]` | Sync subtitles to video audio |
-| `/translate <name>` | Sync English subs (`.en.srt`, `.eng.srt`, `.english.srt`) matching `<name>` to audio, then ask to translate EN→IT |
-| `/delete <name>` | Delete all subs (IT/EN variants) for videos matching `<name>` and re-queue them for a fresh download |
-| `/cleanup` | Find and remove placeholder subtitles |
-| `/excludes` | List excluded folders |
-| `/reset` | Clear cache, rescan from scratch |
-| `/help` | Show all commands |
+The canonical command names are in Italian (the bot speaks Italian), and each one accepts English aliases plus short forms. Examples below show canonical + aliases.
 
-Type any text to search your media library (handles dots in filenames).
+### Search & download
+| Command | Aliases | Description |
+|---|---|---|
+| `/cerca <name>` | `/search`, `/sub` | Search the library (or simply type the name without a slash) |
+| `/scarica <name [year]>` | `/download`, `/req` | Request a new film via Radarr — TMDb disambiguates, then you pick the release (quality, size, language, indexer) from an inline list |
+
+### Sub management
+| Command | Aliases | Description |
+|---|---|---|
+| `/sincronizza <name\|all>` | `/sync` | Sync existing subs to video audio |
+| `/traduci <name>` | `/translate`, `/tr`, `/t` | Sync `.en.srt` and translate EN→IT (DeepL + Claude polish) |
+| `/ritraduci <name>` | `/retranslate`, `/rt` | Delete `.it.srt` and retranslate from the existing `.en.srt` (no re-download) |
+| `/cancella <name>` | `/delete`, `/del` | Delete all subs and re-queue for a fresh search |
+
+### Status & maintenance
+| Command | Aliases | Description |
+|---|---|---|
+| `/stato` | `/status`, `/st` | Current state summary |
+| `/coda` | `/queue`, `/q` | Show currently queued jobs |
+| `/costi` | `/costs`, `/cost` | DeepL chars + Claude polish cost + Claude fallback cost (separate sections) |
+| `/falliti` | `/failed` | List failed videos, with a "Retry all" inline button |
+| `/esclusi` | `/excludes` | List excluded folders |
+| `/log [n]` | `/logs` | Tail the last n log lines (default 30, max 200) |
+| `/scansiona` | `/scan` | Force a manual scan |
+| `/pulisci` | `/cleanup` | Find and remove placeholder/VIP subs |
+| `/reset` | `/azzera` | Clear cache (start from scratch) |
+| `/aiuto` | `/help`, `/?` | Show this command list |
+
+Type any text to search your media library (handles dots in filenames). Typos on slash commands produce a "did you mean?" reply, never a silent fallthrough to search.
 
 ## Subtitle Search Cascade
 
@@ -123,7 +147,7 @@ Single Python file (`sub_fetcher.py`), no frameworks. Runs as a long-lived proce
 | Primary provider | Subdl.com REST API |
 | Fallback provider | OpenSubtitles.com REST API v1 |
 | IMDb ID resolution | `.nfo` files → TMDb search fallback |
-| Translation | Claude API (batches of 100 subtitle blocks) |
+| Translation | DeepL (cue-by-cue, batches of 50) → Claude Haiku polish (batches of 80); Claude Sonnet full-translate as fallback (batches of 40) |
 | Bot interface | Telegram Bot API (polling) |
 | State | JSON file (`/config/state.json`) |
 | Queue | Thread-safe FIFO (download, translate, single jobs) |

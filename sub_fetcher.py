@@ -27,6 +27,7 @@ import urllib.error
 import urllib.parse
 import zipfile
 import io
+import html
 from xmlrpc.client import ServerProxy
 from pathlib import Path
 from datetime import datetime, timedelta
@@ -62,10 +63,31 @@ TMDB_API_URL = "https://api.themoviedb.org/3"
 # SubSource (third subtitle provider)
 SUBSOURCE_API_URL = "https://api.subsource.net/v1"
 
-# Claude API for translation (EN -> IT fallback)
+# Claude API for translation (EN -> IT fallback / polish pass)
 CLAUDE_API_KEY = os.environ.get("CLAUDE_API_KEY", "")
 CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-20250514")
+CLAUDE_POLISH_MODEL = os.environ.get("CLAUDE_POLISH_MODEL", "claude-haiku-4-5-20251001")
 CLAUDE_API_URL = "https://api.anthropic.com/v1/messages"
+
+# DeepL API for primary EN -> IT translation (cue-by-cue, no truncation risk)
+DEEPL_API_KEY = os.environ.get("DEEPL_API_KEY", "")
+DEEPL_API_URL = (
+    "https://api-free.deepl.com/v2/translate"
+    if DEEPL_API_KEY.endswith(":fx")
+    else "https://api.deepl.com/v2/translate"
+)
+# Run a Claude polish pass over DeepL output to rewrite unnatural lines.
+POLISH_TRANSLATION = os.environ.get("POLISH_TRANSLATION", "true").lower() in ("1", "true", "yes")
+
+# Radarr integration (/scarica command — request new films from Telegram).
+RADARR_URL = os.environ.get("RADARR_URL", "").rstrip("/")
+RADARR_API_KEY = os.environ.get("RADARR_API_KEY", "")
+RADARR_ROOT_FOLDER = os.environ.get("RADARR_ROOT_FOLDER", "")
+RADARR_QUALITY_PROFILE = os.environ.get("RADARR_QUALITY_PROFILE", "")
+RADARR_PREFERRED_LANGUAGES = [
+    s.strip().upper() for s in os.environ.get("RADARR_PREFERRED_LANGUAGES", "ITA,ENG").split(",")
+    if s.strip()
+]
 
 # Media paths (inside the container, mapped via volumes)
 SERIES_PATH = "/media/series"
@@ -78,6 +100,7 @@ DEFAULT_EXCLUDES = ["Boris"]
 # State
 STATE_FILE = "/config/state.json"
 BATCHES_FILE = "/config/batches.json"
+REQUESTS_FILE = "/config/requests.json"
 LOG_FILE = "/config/sub_fetcher.log"
 
 # Timing
@@ -123,6 +146,7 @@ def load_state():
         "asked": {},              # path -> {"time": iso, "status": "pending"|"yes"|"no"|"failed"}
         "downloaded": {},         # path -> {"sub": filename, "time": iso}
         "italian_original": {},   # path -> {"time": iso} (cache for TMDb original_language=it)
+        "seen": [],               # list of paths already notified as "new"
         "last_offset": 0,         # Telegram update offset
     }
 
@@ -153,6 +177,26 @@ def save_batches(batches):
             json.dump(batches, f, indent=2, default=str)
     except Exception as e:
         log.error(f"Failed to save batches: {e}")
+
+
+def load_requests():
+    """Pending Radarr requests (films the user asked the bot to download).
+    Kept separate from state.json so /reset doesn't drop them."""
+    if os.path.exists(REQUESTS_FILE):
+        try:
+            with open(REQUESTS_FILE, "r") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {"pending_radarr": {}}
+
+
+def save_requests(requests):
+    try:
+        with open(REQUESTS_FILE, "w") as f:
+            json.dump(requests, f, indent=2, default=str)
+    except Exception as e:
+        log.error(f"Failed to save requests: {e}")
 
 
 # =============================================================================
@@ -393,6 +437,41 @@ def tmdb_find_imdb_id(title, year=None, is_tv=False):
     return None
 
 
+def tmdb_search_movies(query, year=None, limit=5):
+    """Search TMDb for films matching `query`. Returns a list of dicts:
+      {tmdb_id, title, year, original_language, overview, poster_url, director}
+    Used by /scarica to disambiguate which film the user wants."""
+    if not TMDB_API_KEY or not query:
+        return []
+    params = {"api_key": TMDB_API_KEY, "query": query, "include_adult": "false"}
+    if year:
+        params["year"] = str(year)
+    url = f"{TMDB_API_URL}/search/movie?{urllib.parse.urlencode(params)}"
+    try:
+        with urllib.request.urlopen(url, timeout=10) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except Exception as e:
+        log.warning(f"  TMDb search error: {e}")
+        return []
+    out = []
+    for r in (data.get("results") or [])[:limit]:
+        tmdb_id = r.get("id")
+        if not tmdb_id:
+            continue
+        rel_date = r.get("release_date") or ""
+        ryear = int(rel_date[:4]) if rel_date[:4].isdigit() else None
+        poster = r.get("poster_path")
+        out.append({
+            "tmdb_id": tmdb_id,
+            "title": r.get("title") or r.get("original_title") or "?",
+            "year": ryear,
+            "original_language": r.get("original_language"),
+            "overview": (r.get("overview") or "").strip(),
+            "poster_url": f"https://image.tmdb.org/t/p/w342{poster}" if poster else None,
+        })
+    return out
+
+
 def tmdb_get_original_language(title, year=None, is_tv=False):
     """Return the original_language ISO-639-1 code from TMDb (e.g. 'it', 'en'),
     or None if the lookup fails. Uses the first search result, like
@@ -610,6 +689,19 @@ def is_excluded(filepath, excludes):
     return False
 
 
+def _notify_new_media(state, full_path, media_path):
+    """Send a Telegram notification the first time a new media file is detected."""
+    seen = state.setdefault("seen", [])
+    if full_path in seen:
+        return
+    seen.append(full_path)
+    save_state(state)
+    name = friendly_name(full_path)
+    emoji = "🎬" if media_path == FILMS_PATH else "📺"
+    label = "film" if media_path == FILMS_PATH else "serie"
+    tg_send(f"{emoji} Nuovo {label} scaricato:\n<b>{name}</b>")
+
+
 def scan_missing(state, excludes):
     missing = []
     now = datetime.now()
@@ -664,6 +756,7 @@ def scan_missing(state, excludes):
                     save_state(state)
                     continue
 
+                _notify_new_media(state, full_path, media_path)
                 missing.append(full_path)
 
     return missing
@@ -1057,6 +1150,223 @@ def pick_best(results, video_path):
 
 
 # =============================================================================
+# RADARR CLIENT (/scarica command — request new films from Telegram)
+# =============================================================================
+
+class RadarrClient:
+    """Thin wrapper around Radarr v3 REST API.
+    Used by /scarica to add films + run Interactive Search + grab a chosen release."""
+
+    def __init__(self, base_url=None, api_key=None, timeout=30):
+        self.base_url = (base_url or RADARR_URL).rstrip("/")
+        self.api_key = api_key or RADARR_API_KEY
+        self.timeout = timeout
+
+    def _enabled(self):
+        return bool(self.base_url and self.api_key)
+
+    def _request(self, method, path, params=None, body=None, timeout=None):
+        if not self._enabled():
+            raise RuntimeError("RADARR_URL or RADARR_API_KEY not configured")
+        url = f"{self.base_url}/api/v3{path}"
+        if params:
+            url += "?" + urllib.parse.urlencode(params)
+        data = None
+        headers = {"X-Api-Key": self.api_key, "Accept": "application/json"}
+        if body is not None:
+            data = json.dumps(body).encode("utf-8")
+            headers["Content-Type"] = "application/json"
+        req = urllib.request.Request(url, data=data, method=method, headers=headers)
+        with urllib.request.urlopen(req, timeout=timeout or self.timeout) as resp:
+            raw = resp.read()
+            if not raw:
+                return None
+            return json.loads(raw.decode("utf-8"))
+
+    def root_folder(self):
+        """Return configured root folder path, or first one from Radarr if env unset."""
+        if RADARR_ROOT_FOLDER:
+            return RADARR_ROOT_FOLDER
+        folders = self._request("GET", "/rootFolder") or []
+        if not folders:
+            raise RuntimeError("Radarr has no root folder configured")
+        return folders[0]["path"]
+
+    def quality_profile_id(self):
+        """Resolve quality profile env to an integer id (env may be a name or id)."""
+        profiles = self._request("GET", "/qualityprofile") or []
+        if not profiles:
+            raise RuntimeError("Radarr has no quality profile configured")
+        if RADARR_QUALITY_PROFILE:
+            for p in profiles:
+                if str(p["id"]) == str(RADARR_QUALITY_PROFILE) or p["name"].lower() == RADARR_QUALITY_PROFILE.lower():
+                    return p["id"]
+        return profiles[0]["id"]
+
+    def lookup(self, tmdb_id):
+        """Return Radarr's metadata for a TMDb id (also tells us if it's already added/has a file)."""
+        return self._request("GET", "/movie/lookup/tmdb", params={"tmdbId": tmdb_id})
+
+    def find_existing(self, tmdb_id):
+        """If the movie is already in Radarr's library, return its full record (incl. id), else None."""
+        movies = self._request("GET", "/movie") or []
+        for m in movies:
+            if m.get("tmdbId") == tmdb_id:
+                return m
+        return None
+
+    def add(self, tmdb_id):
+        """Add a film to Radarr without auto-grabbing. Returns the new movieId.
+        If the film already exists, returns the existing movieId."""
+        existing = self.find_existing(tmdb_id)
+        if existing:
+            return existing["id"]
+        meta = self.lookup(tmdb_id)
+        if not meta:
+            raise RuntimeError(f"TMDb id {tmdb_id} not found in Radarr lookup")
+        payload = {
+            "title": meta.get("title"),
+            "tmdbId": tmdb_id,
+            "year": meta.get("year"),
+            "titleSlug": meta.get("titleSlug"),
+            "images": meta.get("images", []),
+            "qualityProfileId": self.quality_profile_id(),
+            "rootFolderPath": self.root_folder(),
+            "monitored": True,
+            "minimumAvailability": "released",
+            "addOptions": {
+                "searchForMovie": False,  # We want the release list, not auto-grab.
+            },
+        }
+        result = self._request("POST", "/movie", body=payload)
+        return result["id"]
+
+    def releases(self, movie_id):
+        """GET /release?movieId=<id> — triggers Interactive Search across all indexers.
+        Returns the list as Radarr provides it (Radarr already deduplicates)."""
+        return self._request("GET", "/release", params={"movieId": movie_id}, timeout=120) or []
+
+    def grab(self, guid, indexer_id):
+        """Send the chosen release to the configured download client."""
+        return self._request("POST", "/release", body={"guid": guid, "indexerId": indexer_id})
+
+
+# Languages that frequently appear in release titles. Order matters: longer
+# tokens first so we match "ENGLISH" before "ENG".
+_LANG_TOKENS = [
+    ("ITALIAN", "ITA"), ("ITA", "ITA"), ("iTALiAN", "ITA"),
+    ("ENGLISH", "ENG"), ("ENG", "ENG"),
+    ("MULTI", "MULTI"), ("MULTi", "MULTI"),
+    ("FRENCH", "FRE"), ("FR", "FRE"),
+    ("SPANISH", "SPA"), ("CASTELLANO", "SPA"),
+    ("GERMAN", "GER"),
+]
+
+
+def detect_release_languages(release):
+    """Return a sorted list of language tags (e.g. ['ITA', 'ENG']) for a Radarr release.
+    Prefers Radarr's structured `languages` field; falls back to substring matches
+    on the release title (releases like 'Movie.2024.iTALiAN.ENG.1080p.x265.mkv')."""
+    tags = set()
+    for lang in release.get("languages", []) or []:
+        name = (lang.get("name") or "").lower()
+        if "italian" in name:
+            tags.add("ITA")
+        elif "english" in name:
+            tags.add("ENG")
+        elif name and name != "unknown":
+            tags.add(name[:3].upper())
+
+    title = release.get("title") or ""
+    # Use word boundaries so "ENG" doesn't match "ENGAGE" or "MOTHER ENGINE".
+    upper_title = re.sub(r"[^A-Z]+", " ", title.upper())
+    title_tokens = set(upper_title.split())
+    for token, normalized in _LANG_TOKENS:
+        if token.upper() in title_tokens:
+            tags.add(normalized)
+
+    if not tags:
+        tags.add("?")
+    return sorted(tags)
+
+
+def _flag_for(lang_tags):
+    """Pick a single flag emoji that represents the language mix of a release."""
+    if "ITA" in lang_tags:
+        return "🇮🇹"
+    if "MULTI" in lang_tags:
+        return "🌐"
+    if "ENG" in lang_tags:
+        return "🇬🇧"
+    if lang_tags == ["?"]:
+        return "❔"
+    return "🏳️"
+
+
+def _quality_rank(release):
+    """Map Radarr quality strings to a rank used for sorting (higher = better)."""
+    name = ((release.get("quality") or {}).get("quality") or {}).get("name", "").lower()
+    if "2160" in name or "uhd" in name or "4k" in name:
+        return 4
+    if "1080" in name:
+        return 3
+    if "720" in name:
+        return 2
+    if "480" in name or "dvd" in name:
+        return 1
+    return 0
+
+
+def rank_releases(releases, preferred=None):
+    """Sort releases for the picker:
+      1) preferred-language match comes first
+      2) higher quality first
+      3) more seeders first
+    Non-destructive: returns a new list."""
+    if preferred is None:
+        preferred = RADARR_PREFERRED_LANGUAGES
+
+    def key(r):
+        langs = detect_release_languages(r)
+        # Index of the first preferred language we find in this release (lower = better).
+        # Releases without any preferred language go to the bottom.
+        pref_idx = min(
+            (preferred.index(l) for l in langs if l in preferred),
+            default=len(preferred),
+        )
+        seeders = r.get("seeders") or 0
+        return (pref_idx, -_quality_rank(r), -seeders)
+
+    return sorted(releases, key=key)
+
+
+def _human_size(num_bytes):
+    n = float(num_bytes or 0)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024:
+            return f"{n:.1f} {unit}" if unit != "B" else f"{int(n)} B"
+        n /= 1024
+    return f"{n:.1f} PB"
+
+
+def format_release_button(release):
+    """Compact label for the inline button (Telegram limits ~64 chars but in
+    practice ~80 is fine on most clients). The full title appears in the
+    confirmation card on the next step."""
+    langs = detect_release_languages(release)
+    flag = _flag_for(langs)
+    quality = ((release.get("quality") or {}).get("quality") or {}).get("name", "?")
+    size = _human_size(release.get("size"))
+    seeders = release.get("seeders") or 0
+    lang_str = "+".join(langs[:2]) if langs != ["?"] else "?"
+    label = f"{flag} {quality} · {size} · {lang_str} · {seeders}↑"
+    rejected = release.get("rejections") or []
+    if rejected:
+        label = "🚫 " + label
+    return label[:80]
+
+
+# =============================================================================
 # SUBTITLE SYNC (ffsubsync)
 # =============================================================================
 
@@ -1264,9 +1574,160 @@ def estimate_translation_cost(srt_content):
     return cost, len(blocks)
 
 
+def _claude_translate_call(indexed_texts, video_name):
+    """One Claude API call to translate a list of (local_idx, en_text) pairs.
+
+    Returns a dict with:
+      translations: {local_idx: italian_text}  (only for indices we asked for)
+      input_tokens, output_tokens: usage counters
+      truncated: True if Claude stopped due to max_tokens (the last parsed
+                 line is dropped because it may be a half-sentence)
+      ok: True if the API call succeeded; False on transport/HTTP error
+    """
+    if not indexed_texts:
+        return {"translations": {}, "input_tokens": 0, "output_tokens": 0, "truncated": False, "ok": True}
+
+    asked = {i for i, _ in indexed_texts}
+    text_block = "\n".join(f"[{i}] {t}" for i, t in indexed_texts)
+    prompt = (
+        f"Translate these movie subtitles from English to Italian. "
+        f"Movie: {video_name}. "
+        f"Keep the [N] numbering prefix on each line. "
+        f"Translate naturally — use colloquial Italian as it would appear in a real Italian dub. "
+        f"Keep it concise as subtitles should be. "
+        f"Do NOT add any explanation, just output the translated lines.\n\n"
+        f"{text_block}"
+    )
+    payload = json.dumps({
+        "model": CLAUDE_MODEL,
+        "max_tokens": 8192,
+        "messages": [{"role": "user", "content": prompt}],
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        CLAUDE_API_URL,
+        data=payload,
+        headers={
+            "Content-Type": "application/json",
+            "x-api-key": CLAUDE_API_KEY,
+            "anthropic-version": "2023-06-01",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            result = json.loads(resp.read().decode("utf-8"))
+    except Exception as e:
+        log.error(f"  Claude call failed: {e}")
+        return {"translations": {}, "input_tokens": 0, "output_tokens": 0, "truncated": False, "ok": False}
+
+    usage = result.get("usage", {})
+    in_tokens = usage.get("input_tokens", 0)
+    out_tokens = usage.get("output_tokens", 0)
+
+    raw = ""
+    for chunk in result.get("content", []):
+        if chunk.get("type") == "text":
+            raw += chunk["text"]
+
+    parsed = {}
+    for line in raw.strip().split("\n"):
+        m = re.match(r"\[(\d+)\]\s*(.+)", line.strip())
+        if m:
+            idx = int(m.group(1))
+            # Reject hallucinated indices — only keep cues we actually asked for.
+            if idx in asked:
+                parsed[idx] = m.group(2)
+
+    truncated = result.get("stop_reason") == "max_tokens"
+    # When Claude was cut off, the *last* parsed line is the dangerous one
+    # (may be half a sentence). Drop it so the bisect retry will re-translate it.
+    if truncated and parsed:
+        last_idx = max(parsed)
+        del parsed[last_idx]
+
+    return {
+        "translations": parsed,
+        "input_tokens": in_tokens,
+        "output_tokens": out_tokens,
+        "truncated": truncated,
+        "ok": True,
+    }
+
+
+def _claude_translate_bisect(indexed_texts, video_name, depth=0):
+    """Translate `indexed_texts` (list of (local_idx, en_text)) — if Claude
+    truncates or skips any cue, split the batch in half and recurse so every
+    cue eventually gets a real Italian translation.
+
+    Base case: single cue that *still* doesn't translate → caller keeps EN.
+
+    Returns {"translations": {idx: text}, "input_tokens": int, "output_tokens": int}.
+    """
+    if not indexed_texts:
+        return {"translations": {}, "input_tokens": 0, "output_tokens": 0}
+
+    if depth > 8:
+        # Hard safety net — shouldn't fire in practice since the input shrinks
+        # to ~1 cue long before this.
+        log.error(f"  Claude bisect: depth limit hit, giving up on {len(indexed_texts)} cues")
+        return {"translations": {}, "input_tokens": 0, "output_tokens": 0}
+
+    res = _claude_translate_call(indexed_texts, video_name)
+    in_t = res["input_tokens"]
+    out_t = res["output_tokens"]
+
+    if not res["ok"]:
+        # Transport failure — recurse on halves only if we still have something
+        # to split, otherwise give up on this cue and let caller keep EN.
+        if len(indexed_texts) <= 1:
+            return {"translations": {}, "input_tokens": in_t, "output_tokens": out_t}
+        mid = len(indexed_texts) // 2
+        a = _claude_translate_bisect(indexed_texts[:mid], video_name, depth + 1)
+        b = _claude_translate_bisect(indexed_texts[mid:], video_name, depth + 1)
+        merged = dict(a["translations"]); merged.update(b["translations"])
+        return {
+            "translations": merged,
+            "input_tokens": in_t + a["input_tokens"] + b["input_tokens"],
+            "output_tokens": out_t + a["output_tokens"] + b["output_tokens"],
+        }
+
+    translations = res["translations"]
+    asked = {i for i, _ in indexed_texts}
+    missing = asked - set(translations)
+
+    if not missing and not res["truncated"]:
+        return {"translations": translations, "input_tokens": in_t, "output_tokens": out_t}
+
+    if len(indexed_texts) <= 1:
+        # Single-cue batch still failed — give up on it; caller keeps EN.
+        if missing:
+            log.warning(f"  Claude bisect: cue index {indexed_texts[0][0]} unresolvable after retry, keeping EN")
+        return {"translations": translations, "input_tokens": in_t, "output_tokens": out_t}
+
+    # Retry the missing ones (and the dropped-last-on-truncation if any) by
+    # splitting the batch in half. Translations we already got are kept.
+    to_retry = [(i, t) for i, t in indexed_texts if i not in translations]
+    log.info(f"  Claude bisect: retrying {len(to_retry)}/{len(indexed_texts)} cues with smaller batch")
+    mid = len(to_retry) // 2
+    a = _claude_translate_bisect(to_retry[:mid] if mid else to_retry[:1], video_name, depth + 1) if to_retry else {"translations": {}, "input_tokens": 0, "output_tokens": 0}
+    b = _claude_translate_bisect(to_retry[mid:] if mid else [], video_name, depth + 1)
+
+    merged = dict(translations)
+    merged.update(a["translations"])
+    merged.update(b["translations"])
+    return {
+        "translations": merged,
+        "input_tokens": in_t + a["input_tokens"] + b["input_tokens"],
+        "output_tokens": out_t + a["output_tokens"] + b["output_tokens"],
+    }
+
+
 def translate_srt_with_claude(srt_content, video_name):
     """Translate SRT content from English to Italian using Claude API.
-    Sends text in batches to stay within limits. Returns (translated_srt, usage_stats) tuple."""
+    Batches of 40 cues with automatic bisect-on-failure: if Claude truncates
+    or skips any cue, the batch is recursively split until every cue is
+    translated (or — in the worst case — a single cue persistently fails and
+    is left in English, which is the only way a missing translation can ever
+    survive). Returns the translated SRT string."""
 
     if not CLAUDE_API_KEY:
         log.error("CLAUDE_API_KEY not set, cannot translate")
@@ -1279,43 +1740,205 @@ def translate_srt_with_claude(srt_content, video_name):
 
     log.info(f"  Translating {len(blocks)} subtitle blocks EN->IT via Claude...")
 
-    # Process in batches of ~100 blocks to avoid token limits
-    BATCH_SIZE = 100
+    BATCH_SIZE = 40
     translated_blocks = []
-    total_input_tokens = 0
-    total_output_tokens = 0
+    total_in = 0
+    total_out = 0
 
     for batch_start in range(0, len(blocks), BATCH_SIZE):
         batch = blocks[batch_start:batch_start + BATCH_SIZE]
         batch_num = batch_start // BATCH_SIZE + 1
         total_batches = (len(blocks) + BATCH_SIZE - 1) // BATCH_SIZE
 
-        # Build numbered text for translation
-        lines_to_translate = []
-        for i, (idx, timecode, text) in enumerate(batch):
-            if text.strip():
-                lines_to_translate.append(f"[{i}] {text}")
-
-        if not lines_to_translate:
+        indexed = [(i, text) for i, (_, _, text) in enumerate(batch) if text.strip()]
+        if not indexed:
             translated_blocks.extend(batch)
             continue
 
-        text_block = "\n".join(lines_to_translate)
+        res = _claude_translate_bisect(indexed, video_name)
+        translations = res["translations"]
+        total_in += res["input_tokens"]
+        total_out += res["output_tokens"]
 
+        for i, (idx, timecode, text) in enumerate(batch):
+            translated_blocks.append((idx, timecode, translations.get(i, text)))
+
+        kept_en = sum(1 for i, (_, _, text) in enumerate(batch) if text.strip() and i not in translations)
+        if kept_en:
+            log.warning(f"  Batch {batch_num}/{total_batches}: {len(translations)} translated, {kept_en} kept as EN (unresolvable)")
+        else:
+            log.info(f"  Batch {batch_num}/{total_batches}: {len(translations)} cues translated")
+        time.sleep(1)
+
+    cost = (total_in * CLAUDE_INPUT_PRICE + total_out * CLAUDE_OUTPUT_PRICE) / 1_000_000
+    log.info(f"  Translation cost: {total_in} in + {total_out} out = ${cost:.4f}")
+
+    try:
+        state = load_state()
+        costs = state.setdefault("claude_costs", {"total_input_tokens": 0, "total_output_tokens": 0, "total_cost_usd": 0.0, "translations": 0})
+        costs["total_input_tokens"] += total_in
+        costs["total_output_tokens"] += total_out
+        costs["total_cost_usd"] += cost
+        costs["translations"] += 1
+        save_state(state)
+    except Exception:
+        pass
+
+    return blocks_to_srt(translated_blocks)
+
+
+# =============================================================================
+# DEEPL TRANSLATION (EN -> IT primary path)
+# =============================================================================
+
+# DeepL pricing: Free tier (500k chars/month) + Pro €20/M chars pay-as-you-go.
+DEEPL_PRICE_PER_MILLION_CHARS = 20.0
+
+
+def translate_srt_with_deepl(srt_content):
+    """Translate SRT content from English to Italian using DeepL API.
+    Translates one cue at a time (batched 50/request — DeepL's max), so the
+    output cannot be truncated mid-cue the way an LLM can.
+    Returns (parsed_blocks_with_it_text, total_chars) or None on failure."""
+
+    if not DEEPL_API_KEY:
+        return None
+
+    blocks = parse_srt(srt_content)
+    if not blocks:
+        return None
+
+    # Indices of blocks with non-empty text — we translate only those.
+    payload_indices = [i for i, (_, _, text) in enumerate(blocks) if text.strip()]
+    if not payload_indices:
+        return list(blocks), 0
+
+    log.info(f"  Translating {len(payload_indices)} cues EN->IT via DeepL...")
+
+    out_blocks = list(blocks)
+    total_chars = 0
+    BATCH = 50
+
+    for start in range(0, len(payload_indices), BATCH):
+        slice_idx = payload_indices[start:start + BATCH]
+        texts = [blocks[i][2] for i in slice_idx]
+        total_chars += sum(len(t) for t in texts)
+
+        try:
+            payload = json.dumps({
+                "text": texts,
+                "source_lang": "EN",
+                "target_lang": "IT",
+                "preserve_formatting": True,
+                "tag_handling": "html",  # Preserve <i>...</i> italics common in SRT
+            }).encode("utf-8")
+
+            req = urllib.request.Request(
+                DEEPL_API_URL,
+                data=payload,
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"DeepL-Auth-Key {DEEPL_API_KEY}",
+                },
+            )
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                result = json.loads(resp.read().decode("utf-8"))
+
+            translations = result.get("translations", [])
+            if len(translations) != len(texts):
+                log.error(f"  DeepL returned {len(translations)} translations for {len(texts)} inputs — aborting")
+                return None
+
+            for local_i, idx in enumerate(slice_idx):
+                idx_str, timecode, _ = out_blocks[idx]
+                out_blocks[idx] = (idx_str, timecode, translations[local_i]["text"])
+
+        except urllib.error.HTTPError as e:
+            body = ""
+            try:
+                body = e.read().decode("utf-8", errors="ignore")
+            except Exception:
+                pass
+            log.error(f"  DeepL HTTP {e.code} (batch {start//BATCH + 1}): {body[:200]}")
+            return None
+        except Exception as e:
+            log.error(f"  DeepL error (batch {start//BATCH + 1}): {e}")
+            return None
+
+    cost = total_chars * DEEPL_PRICE_PER_MILLION_CHARS / 1_000_000
+    log.info(f"  DeepL: {total_chars} chars translated (~${cost:.4f} if on paid tier, free tier is free up to 500k/month)")
+
+    # Track DeepL usage for visibility.
+    try:
+        state = load_state()
+        stats = state.setdefault("deepl_stats", {"total_chars": 0, "translations": 0})
+        stats["total_chars"] += total_chars
+        stats["translations"] += 1
+        save_state(state)
+    except Exception:
+        pass
+
+    return out_blocks, total_chars
+
+
+# =============================================================================
+# CLAUDE POLISH PASS (refines weak DeepL translations)
+# =============================================================================
+
+# Haiku 4.5 pricing — used for the polish pass (much cheaper than Sonnet).
+CLAUDE_HAIKU_INPUT_PRICE = 1.0   # $1/M input tokens
+CLAUDE_HAIKU_OUTPUT_PRICE = 5.0  # $5/M output tokens
+
+
+def polish_translation_with_claude(en_blocks, it_blocks, video_name):
+    """Send Claude both EN and DeepL-IT cues; ask it to rewrite ONLY the lines
+    that sound unnatural in Italian. Output is sparse, so truncation is unlikely.
+    Returns (polished_blocks, num_rewritten)."""
+
+    if not CLAUDE_API_KEY:
+        log.warning("  CLAUDE_API_KEY not set, skipping polish pass")
+        return it_blocks, 0
+
+    pairs = []
+    for i, ((_, _, en_text), (_, _, it_text)) in enumerate(zip(en_blocks, it_blocks)):
+        if en_text.strip() and it_text.strip():
+            single_en = en_text.replace("\n", " ").strip()
+            single_it = it_text.replace("\n", " ").strip()
+            pairs.append((i, single_en, single_it))
+
+    if not pairs:
+        return it_blocks, 0
+
+    log.info(f"  Polishing {len(pairs)} translated cues via Claude ({CLAUDE_POLISH_MODEL})...")
+
+    BATCH_SIZE = 80
+    rewrites = {}
+    total_in = 0
+    total_out = 0
+
+    for batch_start in range(0, len(pairs), BATCH_SIZE):
+        batch = pairs[batch_start:batch_start + BATCH_SIZE]
+        batch_num = batch_start // BATCH_SIZE + 1
+        total_batches = (len(pairs) + BATCH_SIZE - 1) // BATCH_SIZE
+
+        lines = [f"[{i}] EN: {en} | IT: {it_}" for (i, en, it_) in batch]
         prompt = (
-            f"Translate these movie subtitles from English to Italian. "
-            f"Movie: {video_name}. "
-            f"Keep the [N] numbering prefix on each line. "
-            f"Translate naturally — use colloquial Italian as it would appear in a real Italian dub. "
-            f"Keep it concise as subtitles should be. "
-            f"Do NOT add any explanation, just output the translated lines.\n\n"
-            f"{text_block}"
+            f"Sei un adattatore di sottotitoli italiani. Film: {video_name}.\n"
+            f"Per ogni riga sotto trovi la frase inglese e una traduzione italiana automatica.\n"
+            f"Se la traduzione italiana suona innaturale, troppo letterale, o sbagliata per un sottotitolo "
+            f"cinematografico (in cui si usa italiano parlato/colloquiale, come in un doppiaggio), riscrivila. "
+            f"Altrimenti SALTA quella riga.\n\n"
+            f"Output: SOLO le righe da riscrivere, una per riga, nel formato esatto:\n"
+            f"[N] testo riscritto\n\n"
+            f"Niente intestazioni, niente commenti, niente spiegazioni. Se nessuna riga va riscritta, "
+            f"restituisci stringa vuota.\n\n"
+            + "\n".join(lines)
         )
 
         try:
             payload = json.dumps({
-                "model": CLAUDE_MODEL,
-                "max_tokens": 4096,
+                "model": CLAUDE_POLISH_MODEL,
+                "max_tokens": 8192,
                 "messages": [{"role": "user", "content": prompt}],
             }).encode("utf-8")
 
@@ -1328,61 +1951,81 @@ def translate_srt_with_claude(srt_content, video_name):
                     "anthropic-version": "2023-06-01",
                 },
             )
-
             with urllib.request.urlopen(req, timeout=120) as resp:
                 result = json.loads(resp.read().decode("utf-8"))
 
-            # Track token usage
             usage = result.get("usage", {})
-            total_input_tokens += usage.get("input_tokens", 0)
-            total_output_tokens += usage.get("output_tokens", 0)
+            total_in += usage.get("input_tokens", 0)
+            total_out += usage.get("output_tokens", 0)
 
-            # Extract translated text
-            translated_text = ""
-            for block_resp in result.get("content", []):
-                if block_resp.get("type") == "text":
-                    translated_text += block_resp["text"]
+            text = ""
+            for chunk in result.get("content", []):
+                if chunk.get("type") == "text":
+                    text += chunk["text"]
 
-            # Parse translated lines back by [N] prefix
-            translations = {}
-            for line in translated_text.strip().split("\n"):
+            parsed_in_batch = {}
+            for line in text.strip().split("\n"):
                 line = line.strip()
-                m = re.match(r"\[(\d+)\]\s*(.*)", line)
+                m = re.match(r"\[(\d+)\]\s*(.+)", line)
                 if m:
-                    translations[int(m.group(1))] = m.group(2)
+                    parsed_in_batch[int(m.group(1))] = m.group(2)
 
-            # Rebuild batch with translations
-            for i, (idx, timecode, text) in enumerate(batch):
-                if i in translations:
-                    translated_blocks.append((idx, timecode, translations[i]))
-                else:
-                    translated_blocks.append((idx, timecode, text))
+            # If the model was cut off, drop the last rewrite — it may be truncated.
+            if result.get("stop_reason") == "max_tokens" and parsed_in_batch:
+                last_idx = max(parsed_in_batch)
+                log.warning(f"  Polish batch {batch_num}/{total_batches} hit max_tokens; dropping cue [{last_idx}]")
+                del parsed_in_batch[last_idx]
 
-            log.info(f"  Batch {batch_num}/{total_batches} translated ({len(translations)} lines)")
-            time.sleep(1)  # Rate limiting
+            rewrites.update(parsed_in_batch)
+            log.info(f"  Polish batch {batch_num}/{total_batches}: {len(parsed_in_batch)} rewrites")
+            time.sleep(0.5)
 
         except Exception as e:
-            log.error(f"  Claude translation error (batch {batch_num}): {e}")
-            # Keep original English for this batch on error
-            translated_blocks.extend(batch)
+            log.error(f"  Polish error (batch {batch_num}): {e} — keeping DeepL output for this batch")
 
-    # Log and track costs
-    cost = (total_input_tokens * CLAUDE_INPUT_PRICE + total_output_tokens * CLAUDE_OUTPUT_PRICE) / 1_000_000
-    log.info(f"  Translation cost: {total_input_tokens} in + {total_output_tokens} out = ${cost:.4f}")
+    cost = (total_in * CLAUDE_HAIKU_INPUT_PRICE + total_out * CLAUDE_HAIKU_OUTPUT_PRICE) / 1_000_000
+    log.info(f"  Polish: {len(rewrites)}/{len(pairs)} cues rewritten, {total_in} in + {total_out} out = ${cost:.4f}")
 
-    # Save usage to state
+    polished = list(it_blocks)
+    for i, new_text in rewrites.items():
+        if 0 <= i < len(polished):
+            idx_str, timecode, _ = polished[i]
+            polished[i] = (idx_str, timecode, new_text)
+
+    # Track polish cost separately so claude_costs (Sonnet full-translate) stays clean.
     try:
         state = load_state()
-        costs = state.setdefault("claude_costs", {"total_input_tokens": 0, "total_output_tokens": 0, "total_cost_usd": 0.0, "translations": 0})
-        costs["total_input_tokens"] += total_input_tokens
-        costs["total_output_tokens"] += total_output_tokens
+        costs = state.setdefault("claude_polish_costs", {"total_input_tokens": 0, "total_output_tokens": 0, "total_cost_usd": 0.0, "polishes": 0})
+        costs["total_input_tokens"] += total_in
+        costs["total_output_tokens"] += total_out
         costs["total_cost_usd"] += cost
-        costs["translations"] += 1
+        costs["polishes"] += 1
         save_state(state)
     except Exception:
         pass
 
-    return blocks_to_srt(translated_blocks)
+    return polished, len(rewrites)
+
+
+def translate_srt(srt_content, video_name):
+    """Primary EN->IT translation entry point.
+    Strategy: DeepL (cue-by-cue, no truncation) + optional Claude polish pass.
+    Falls back to full Claude translation if DeepL is unavailable.
+    Returns translated SRT string or None on failure."""
+
+    if DEEPL_API_KEY:
+        deepl_result = translate_srt_with_deepl(srt_content)
+        if deepl_result is not None:
+            it_blocks, _ = deepl_result
+            en_blocks = parse_srt(srt_content)
+            if POLISH_TRANSLATION and CLAUDE_API_KEY:
+                it_blocks, _ = polish_translation_with_claude(en_blocks, it_blocks, video_name)
+            else:
+                log.info("  Polish pass skipped (POLISH_TRANSLATION disabled or no CLAUDE_API_KEY)")
+            return blocks_to_srt(it_blocks)
+        log.warning("  DeepL translation failed, falling back to Claude full-translate")
+
+    return translate_srt_with_claude(srt_content, video_name)
 
 
 def _cascade_search(client, video_path, language, file_hash=None, file_size=0, trace=None):
@@ -1512,6 +2155,43 @@ def _save_sub_and_update_state(video_path, sub_path, source, state):
     }
     state["asked"].pop(video_path, None)
     save_state(state)
+    _notify_radarr_request_ready(video_path)
+
+
+def _notify_radarr_request_ready(video_path):
+    """If this video matches a pending /scarica request, send a 'pronto' Telegram
+    notification and clear the request. Match is by title+year derived from the
+    filename, since Radarr's downloaded filename rarely contains the TMDb id."""
+    try:
+        parsed = parse_video(video_path)
+    except Exception:
+        return
+    name = (parsed.get("name") or "").lower().strip()
+    year = parsed.get("year")
+    if not name:
+        return
+
+    requests_state = load_requests()
+    pending = requests_state.get("pending_radarr", {})
+    matched_key = None
+    for key, entry in list(pending.items()):
+        if not key.startswith("download:"):
+            continue
+        if (entry.get("title", "").lower().strip() == name and
+                (not year or not entry.get("year") or entry["year"] == year)):
+            matched_key = key
+            break
+    if not matched_key:
+        return
+
+    entry = pending.pop(matched_key)
+    save_requests(requests_state)
+    title_label = entry["title"] + (f" ({entry['year']})" if entry.get("year") else "")
+    tg_send(
+        f"📬 <b>Pronto:</b> {title_label}\n"
+        f"📁 {os.path.basename(video_path)}\n"
+        f"📡 Era stato richiesto via /scarica ({entry.get('indexer', '?')})."
+    )
 
 
 def _translate_and_save(eng_content, video_path, state, silent=False, skip_sync=False):
@@ -1543,9 +2223,12 @@ def _translate_and_save(eng_content, video_path, state, silent=False, skip_sync=
     video_name = friendly_name(video_path)
 
     est_cost, num_blocks = estimate_translation_cost(eng_text)
-    log.info(f"  Estimated translation cost: ${est_cost:.4f} ({num_blocks} blocks)")
+    if DEEPL_API_KEY:
+        log.info(f"  Using DeepL primary path ({num_blocks} cues)" + (" + Claude polish" if POLISH_TRANSLATION and CLAUDE_API_KEY else ""))
+    else:
+        log.info(f"  Estimated Claude translation cost: ${est_cost:.4f} ({num_blocks} blocks)")
 
-    translated_srt = translate_srt_with_claude(eng_text, video_name)
+    translated_srt = translate_srt(eng_text, video_name)
 
     if not translated_srt:
         log.error(f"  Translation failed for: {os.path.basename(video_path)}")
@@ -1562,17 +2245,25 @@ def _translate_and_save(eng_content, video_path, state, silent=False, skip_sync=
 
     # Get actual cost from state (updated by translate_srt_with_claude)
     actual_state = load_state()
-    costs = actual_state.get("claude_costs", {})
-    total_spent = costs.get("total_cost_usd", 0.0)
+    claude_spent = actual_state.get("claude_costs", {}).get("total_cost_usd", 0.0)
+    polish_spent = actual_state.get("claude_polish_costs", {}).get("total_cost_usd", 0.0)
+    deepl_chars = actual_state.get("deepl_stats", {}).get("total_chars", 0)
+    total_spent = claude_spent + polish_spent
 
-    _save_sub_and_update_state(video_path, sub_path, "Claude EN→IT translation", state)
+    if DEEPL_API_KEY:
+        engine = "DeepL + Claude polish" if (POLISH_TRANSLATION and CLAUDE_API_KEY) else "DeepL"
+    else:
+        engine = "Claude"
+
+    _save_sub_and_update_state(video_path, sub_path, f"{engine} EN→IT translation", state)
     log.info(f"  ✅ Translated & saved: {os.path.basename(sub_path)}")
     if not silent:
         tg_send(
-            f"🤖 Sub ITA tradotto da ENG (Claude):\n"
+            f"🤖 Sub ITA tradotto da ENG ({engine}):\n"
             f"<b>{friendly_name(video_path)}</b>\n"
             f"📁 {os.path.basename(sub_path)}\n"
             f"💰 Totale speso: ${total_spent:.4f}"
+            + (f" | DeepL: {deepl_chars:,} char" if deepl_chars else "")
         )
     return True
 
@@ -1631,7 +2322,7 @@ def do_download(video_path, state, silent=False, translate=True, trace=None):
                 import shutil
                 shutil.copy2(existing["path"], en_srt_path)
             log.info(f"  Found existing English sub: {existing['path']}")
-            if translate and CLAUDE_API_KEY:
+            if translate and (DEEPL_API_KEY or CLAUDE_API_KEY):
                 log.info(f"  Translating existing EN sub...")
                 if _translate_and_save(en_srt_path, video_path, state, silent=silent, skip_sync=True):
                     return True
@@ -1686,7 +2377,7 @@ def do_download(video_path, state, silent=False, translate=True, trace=None):
 
     # Only ENG was saved — caller decides about translation
     log.info(f"  ✅ EN sub saved (no ITA found, translation deferred)")
-    if translate and CLAUDE_API_KEY:
+    if translate and (DEEPL_API_KEY or CLAUDE_API_KEY):
         if _translate_and_save(en_srt_path, video_path, state, silent=silent, skip_sync=True):
             return True
     return "en_only"
@@ -1925,6 +2616,803 @@ def find_path_by_hash(state, path_hash):
     return None
 
 
+# =============================================================================
+# TELEGRAM COMMAND DISPATCHER
+# =============================================================================
+
+def _levenshtein(a, b):
+    """Simple Levenshtein distance, used to suggest the closest known command
+    when the user mistypes a slash command. O(len(a)*len(b)) — fine for the
+    short command strings we use."""
+    if a == b:
+        return 0
+    if not a:
+        return len(b)
+    if not b:
+        return len(a)
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        curr = [i]
+        for j, cb in enumerate(b, 1):
+            cost = 0 if ca == cb else 1
+            curr.append(min(curr[-1] + 1, prev[j] + 1, prev[j - 1] + cost))
+        prev = curr
+    return prev[-1]
+
+
+def do_scarica_search(query, progress_msg_id=None):
+    """Step 1: search TMDb and show film disambiguation buttons.
+    Accepts queries like 'Punch-Drunk Love' or 'Punch-Drunk Love 2002'."""
+    if not RADARR_URL or not RADARR_API_KEY:
+        msg = "❌ Radarr non configurato (mancano RADARR_URL e/o RADARR_API_KEY)."
+        if progress_msg_id:
+            tg_edit_message(progress_msg_id, msg)
+        else:
+            tg_send(msg)
+        return
+    if not TMDB_API_KEY:
+        msg = "❌ TMDB_API_KEY non configurato — serve per cercare il film."
+        if progress_msg_id:
+            tg_edit_message(progress_msg_id, msg)
+        else:
+            tg_send(msg)
+        return
+
+    # Heuristic: trailing 4-digit token is a year hint.
+    year = None
+    parts = query.rsplit(None, 1)
+    if len(parts) == 2 and parts[1].isdigit() and len(parts[1]) == 4:
+        year = int(parts[1])
+        query = parts[0]
+
+    candidates = tmdb_search_movies(query, year=year, limit=5)
+    if not candidates:
+        msg = f"❌ Nessun film trovato per '<b>{query}</b>'. Prova con titolo + anno."
+        if progress_msg_id:
+            tg_edit_message(progress_msg_id, msg)
+        else:
+            tg_send(msg)
+        return
+
+    # Persist the candidate list under a single hash so the user can pick by tapping.
+    film_hash = str(abs(hash(("scarica", tuple(c["tmdb_id"] for c in candidates)))))[:8]
+    requests = load_requests()
+    pending = requests.setdefault("pending_radarr", {})
+    pending[f"candidates:{film_hash}"] = {"candidates": candidates, "ts": datetime.now().isoformat()}
+    save_requests(requests)
+
+    rows = []
+    for c in candidates:
+        ryear = f" ({c['year']})" if c["year"] else ""
+        lang = (c["original_language"] or "?").upper()
+        label = f"🎬 {c['title']}{ryear} — {lang}"[:80]
+        rows.append([{"text": label, "callback_data": f"radarr_pick:{film_hash}:{c['tmdb_id']}"}])
+    rows.append([{"text": "❌ Annulla", "callback_data": f"radarr_cancel:{film_hash}"}])
+
+    body = f"🔎 Trovati {len(candidates)} risultati per '<b>{query}</b>'. Quale?"
+    if progress_msg_id:
+        tg_edit_message(progress_msg_id, body, reply_markup={"inline_keyboard": rows})
+    else:
+        tg_send(body, reply_markup={"inline_keyboard": rows})
+
+
+def do_scarica_releases(film_hash, tmdb_id, progress_msg_id=None):
+    """Step 2: add the film to Radarr (no auto-grab) and show the release list."""
+    client = RadarrClient()
+    requests_state = load_requests()
+    pending = requests_state.setdefault("pending_radarr", {})
+
+    entry = pending.get(f"candidates:{film_hash}")
+    candidate = None
+    if entry:
+        for c in entry.get("candidates", []):
+            if c["tmdb_id"] == tmdb_id:
+                candidate = c
+                break
+    if not candidate:
+        # Re-fetch from TMDb so the flow doesn't dead-end if requests.json was cleared.
+        try:
+            meta = client.lookup(tmdb_id)
+        except Exception as e:
+            msg = f"❌ Errore Radarr lookup: {e}"
+            if progress_msg_id:
+                tg_edit_message(progress_msg_id, msg)
+            else:
+                tg_send(msg)
+            return
+        candidate = {
+            "tmdb_id": tmdb_id,
+            "title": meta.get("title", "?"),
+            "year": meta.get("year"),
+            "original_language": meta.get("originalLanguage", {}).get("name"),
+        }
+
+    title_label = f"{candidate['title']}" + (f" ({candidate['year']})" if candidate.get("year") else "")
+
+    # Check if Radarr already has the file on disk — short-circuit if so.
+    try:
+        existing = client.find_existing(tmdb_id)
+    except Exception as e:
+        msg = f"❌ Radarr non raggiungibile: {e}"
+        if progress_msg_id:
+            tg_edit_message(progress_msg_id, msg)
+        else:
+            tg_send(msg)
+        return
+
+    if existing and existing.get("hasFile"):
+        path = existing.get("movieFile", {}).get("path") or existing.get("path", "?")
+        msg = (
+            f"ℹ️ <b>{title_label}</b> è già scaricato in Radarr.\n"
+            f"📁 <code>{path}</code>\n\n"
+            f"Per ri-scaricarlo usa direttamente Radarr; per rifare i sub: <code>/cancella {candidate['title']}</code>."
+        )
+        if progress_msg_id:
+            tg_edit_message(progress_msg_id, msg)
+        else:
+            tg_send(msg)
+        return
+
+    if progress_msg_id:
+        tg_edit_message(progress_msg_id, f"🔎 Cerco rilasci per <b>{title_label}</b>… (può richiedere qualche secondo)")
+
+    try:
+        movie_id = client.add(tmdb_id)
+    except urllib.error.HTTPError as e:
+        body = ""
+        try:
+            body = e.read().decode("utf-8", errors="ignore")
+        except Exception:
+            pass
+        msg = f"❌ Radarr add HTTP {e.code}: {body[:200]}"
+        if progress_msg_id:
+            tg_edit_message(progress_msg_id, msg)
+        else:
+            tg_send(msg)
+        return
+    except Exception as e:
+        msg = f"❌ Errore aggiunta in Radarr: {e}"
+        if progress_msg_id:
+            tg_edit_message(progress_msg_id, msg)
+        else:
+            tg_send(msg)
+        return
+
+    try:
+        releases = client.releases(movie_id)
+    except Exception as e:
+        msg = f"❌ Errore Interactive Search: {e}"
+        if progress_msg_id:
+            tg_edit_message(progress_msg_id, msg)
+        else:
+            tg_send(msg)
+        return
+
+    if not releases:
+        msg = (
+            f"⚠️ Nessun rilascio trovato per <b>{title_label}</b> sugli indexer configurati.\n"
+            f"Riprova più tardi o controlla i profile in Radarr."
+        )
+        if progress_msg_id:
+            tg_edit_message(progress_msg_id, msg)
+        else:
+            tg_send(msg)
+        return
+
+    ranked = rank_releases(releases)
+    # Strip Radarr's bulky fields we don't need to persist (full title list comments etc.)
+    slim = []
+    for r in ranked:
+        slim.append({
+            "guid": r.get("guid"),
+            "indexerId": r.get("indexerId"),
+            "indexer": r.get("indexer"),
+            "title": r.get("title"),
+            "size": r.get("size"),
+            "seeders": r.get("seeders"),
+            "leechers": r.get("leechers"),
+            "quality": r.get("quality"),
+            "languages": r.get("languages"),
+            "rejections": r.get("rejections"),
+        })
+
+    pending[f"film:{film_hash}"] = {
+        "tmdb_id": tmdb_id,
+        "movie_id": movie_id,
+        "title": candidate["title"],
+        "year": candidate.get("year"),
+        "releases": slim,
+        "ts": datetime.now().isoformat(),
+    }
+    pending.pop(f"candidates:{film_hash}", None)
+    save_requests(requests_state)
+
+    _render_release_page(film_hash, page=0, progress_msg_id=progress_msg_id)
+
+
+RELEASES_PER_PAGE = 8
+
+
+def _render_release_page(film_hash, page, progress_msg_id=None):
+    requests_state = load_requests()
+    entry = requests_state.get("pending_radarr", {}).get(f"film:{film_hash}")
+    if not entry:
+        msg = "⚠️ Sessione di download scaduta. Lancia di nuovo /scarica."
+        if progress_msg_id:
+            tg_edit_message(progress_msg_id, msg)
+        else:
+            tg_send(msg)
+        return
+
+    releases = entry["releases"]
+    total_pages = max(1, (len(releases) + RELEASES_PER_PAGE - 1) // RELEASES_PER_PAGE)
+    page = max(0, min(page, total_pages - 1))
+    start = page * RELEASES_PER_PAGE
+    chunk = releases[start:start + RELEASES_PER_PAGE]
+
+    rows = []
+    for offset, rel in enumerate(chunk):
+        global_idx = start + offset
+        label = format_release_button(rel)
+        rows.append([{"text": label, "callback_data": f"radarr_rel:{film_hash}:{global_idx}"}])
+
+    nav = []
+    if page > 0:
+        nav.append({"text": "◀️ Indietro", "callback_data": f"radarr_page:{film_hash}:{page - 1}"})
+    if page < total_pages - 1:
+        nav.append({"text": "Avanti ▶️", "callback_data": f"radarr_page:{film_hash}:{page + 1}"})
+    if nav:
+        rows.append(nav)
+    rows.append([{"text": "❌ Annulla", "callback_data": f"radarr_cancel:{film_hash}"}])
+
+    title_label = entry["title"] + (f" ({entry['year']})" if entry.get("year") else "")
+    rejected = sum(1 for r in chunk if r.get("rejections"))
+    warning = ""
+    if rejected == len(chunk):
+        warning = "\n⚠️ Tutti i rilasci in questa pagina hanno rejection di Radarr — verifica prima di scegliere."
+
+    body = (
+        f"🎬 <b>{title_label}</b>\n"
+        f"Scegli il rilascio (pagina {page + 1}/{total_pages}, {len(releases)} totali):\n"
+        f"<i>quality · size · lingua · seeders</i>{warning}"
+    )
+    if progress_msg_id:
+        tg_edit_message(progress_msg_id, body, reply_markup={"inline_keyboard": rows})
+    else:
+        tg_send(body, reply_markup={"inline_keyboard": rows})
+
+
+def _render_release_confirm(film_hash, release_idx, progress_msg_id=None):
+    requests_state = load_requests()
+    entry = requests_state.get("pending_radarr", {}).get(f"film:{film_hash}")
+    if not entry:
+        return False
+    releases = entry["releases"]
+    if not (0 <= release_idx < len(releases)):
+        return False
+    rel = releases[release_idx]
+    langs = detect_release_languages(rel)
+    flag = _flag_for(langs)
+    quality = ((rel.get("quality") or {}).get("quality") or {}).get("name", "?")
+    size = _human_size(rel.get("size"))
+    seeders = rel.get("seeders") or 0
+    leechers = rel.get("leechers") or 0
+    indexer = rel.get("indexer") or "?"
+    rejections = rel.get("rejections") or []
+
+    title_label = entry["title"] + (f" ({entry['year']})" if entry.get("year") else "")
+    body = (
+        f"⬇️ <b>Conferma grab</b>\n\n"
+        f"🎬 <b>{title_label}</b>\n"
+        f"{flag} {'+'.join(langs)} · {quality} · {size}\n"
+        f"📡 Indexer: {indexer}\n"
+        f"👥 {seeders}↑ / {leechers}↓\n\n"
+        f"<i>{rel.get('title','?')[:200]}</i>"
+    )
+    if rejections:
+        body += "\n\n🚫 <b>Radarr non lo avrebbe scelto:</b>\n" + "\n".join(f"  • {r}" for r in rejections)
+
+    rows = [[
+        {"text": "⬇️ Conferma grab", "callback_data": f"radarr_grab:{film_hash}:{release_idx}"},
+        {"text": "↩️ Cambia release", "callback_data": f"radarr_page:{film_hash}:0"},
+    ], [
+        {"text": "❌ Annulla", "callback_data": f"radarr_cancel:{film_hash}"},
+    ]]
+    if progress_msg_id:
+        tg_edit_message(progress_msg_id, body, reply_markup={"inline_keyboard": rows})
+    else:
+        tg_send(body, reply_markup={"inline_keyboard": rows})
+    return True
+
+
+def do_retranslate(query, state, progress_msg_id=None):
+    """Force re-translation of all .it.srt matching `query`:
+    delete the existing .it.srt, then run the standard translate-prep flow
+    (which will find them eligible because no .it.srt remains).
+    The user still confirms via the cost-button to avoid accidental spend."""
+    matches = find_videos_by_name(query)
+    if not matches:
+        msg = f"❌ Nessun video trovato per '<b>{query}</b>'"
+        if progress_msg_id:
+            tg_edit_message(progress_msg_id, msg)
+        else:
+            tg_send(msg)
+        return
+
+    deleted = 0
+    no_en = 0
+    for video_path in matches:
+        sub_path = os.path.splitext(video_path)[0] + ".it.srt"
+        if not os.path.exists(sub_path):
+            continue
+        if not find_english_sub(video_path):
+            no_en += 1
+            continue
+        try:
+            os.remove(sub_path)
+            deleted += 1
+            state["downloaded"].pop(video_path, None)
+            state["asked"].pop(video_path, None)
+        except Exception as e:
+            log.warning(f"  retranslate: failed to delete {sub_path}: {e}")
+
+    save_state(state)
+
+    if deleted == 0:
+        warn = f"⚠️ Nessuna traduzione da rifare per '<b>{query}</b>'."
+        if no_en:
+            warn += f"\n{no_en} video hanno .it.srt ma manca .en.srt — usa /cancella per ri-cercare."
+        if progress_msg_id:
+            tg_edit_message(progress_msg_id, warn)
+        else:
+            tg_send(warn)
+        return
+
+    if progress_msg_id:
+        tg_edit_message(progress_msg_id, f"🗑 Cancellati {deleted} .it.srt. Preparo la ritraduzione...")
+
+    do_translate_prep(query, state, progress_msg_id=progress_msg_id)
+
+
+def _cmd_stato(arg, state, excludes):
+    fresh = load_state()
+    pending = sum(1 for v in fresh["asked"].values() if v["status"] == "pending")
+    downloaded = len(fresh["downloaded"])
+    failed = sum(1 for v in fresh["asked"].values() if v["status"] == "failed")
+    excluded = len(excludes)
+    tg_send(
+        f"📊 <b>Stato</b>\n\n"
+        f"⏳ In attesa di risposta: {pending}\n"
+        f"✅ Scaricati: {downloaded}\n"
+        f"❌ Non trovati: {failed}\n"
+        f"🚫 Cartelle escluse: {excluded}\n"
+        f"   ({', '.join(sorted(excludes)) if excludes else 'nessuna'})"
+    )
+
+
+def _cmd_scansiona(arg, state, excludes):
+    tg_send("🔍 Avvio scansione manuale...")
+    missing = scan_missing(state, excludes)
+    tg_send(f"🔍 Trovati {len(missing)} video senza sub ITA")
+
+
+def _cmd_costi(arg, state, excludes):
+    s = load_state()
+    sonnet = s.get("claude_costs", {})
+    polish = s.get("claude_polish_costs", {})
+    deepl = s.get("deepl_stats", {})
+
+    deepl_chars = deepl.get("total_chars", 0)
+    deepl_runs = deepl.get("translations", 0)
+    deepl_eq_cost = deepl_chars * DEEPL_PRICE_PER_MILLION_CHARS / 1_000_000
+
+    pol_in = polish.get("total_input_tokens", 0)
+    pol_out = polish.get("total_output_tokens", 0)
+    pol_cost = polish.get("total_cost_usd", 0.0)
+    pol_runs = polish.get("polishes", 0)
+
+    son_in = sonnet.get("total_input_tokens", 0)
+    son_out = sonnet.get("total_output_tokens", 0)
+    son_cost = sonnet.get("total_cost_usd", 0.0)
+    son_runs = sonnet.get("translations", 0)
+
+    total_paid = pol_cost + son_cost
+
+    sections = [f"💰 <b>Costi traduzione</b>"]
+
+    sections.append(
+        f"\n🌐 <b>DeepL</b> (primario)\n"
+        f"  Caratteri: {deepl_chars:,}\n"
+        f"  Traduzioni: {deepl_runs}\n"
+        f"  Costo equivalente: ${deepl_eq_cost:.4f} (gratis fino a 500k/mese su free tier)"
+    )
+
+    sections.append(
+        f"\n✨ <b>Polish</b> (Claude Haiku 4.5)\n"
+        f"  Token: {pol_in:,} in + {pol_out:,} out\n"
+        f"  Polish eseguiti: {pol_runs}\n"
+        f"  Costo: ${pol_cost:.4f}"
+    )
+
+    sections.append(
+        f"\n🤖 <b>Fallback</b> (Claude Sonnet)\n"
+        f"  Token: {son_in:,} in + {son_out:,} out\n"
+        f"  Traduzioni: {son_runs}\n"
+        f"  Costo: ${son_cost:.4f}"
+    )
+
+    sections.append(f"\n📈 <b>Totale Claude: ${total_paid:.4f}</b>")
+    tg_send("\n".join(sections))
+
+
+def _cmd_esclusi(arg, state, excludes):
+    if excludes:
+        lines = "\n".join(f"  • {e}" for e in sorted(excludes))
+        tg_send(f"🚫 <b>Cartelle escluse:</b>\n{lines}")
+    else:
+        tg_send("🚫 Nessuna cartella esclusa")
+
+
+def _cmd_reset(arg, state, excludes):
+    state["asked"] = {}
+    state["downloaded"] = {}
+    save_state(state)
+    tg_send("🔄 Cache resettata. La prossima scansione ripartirà da zero.")
+
+
+def _cmd_sincronizza(arg, state, excludes):
+    if not arg:
+        tg_send(
+            "Usa: <code>/sincronizza nome serie o film</code>\n"
+            "Es: <code>/sincronizza Pluribus</code> oppure <code>/sincronizza all</code> per tutti."
+        )
+        return
+    pos = queue_position()
+    result = tg_send(
+        f"🔄 Sync <b>{arg}</b> in coda..."
+        + (f"\n⏳ Posizione {pos + 1}" if pos > 0 else "")
+    )
+    msg_id = result["result"]["message_id"] if result and result.get("ok") else None
+    download_queue.put({"type": "sync", "query": arg, "msg_id": msg_id})
+
+
+def _cmd_cancella(arg, state, excludes):
+    if not arg:
+        tg_send(
+            "Usa: <code>/cancella nome film o serie</code>\n"
+            "Cancella tutti i sub (IT/EN) e rimette in coda per nuova ricerca."
+        )
+        return
+    offer_delete(arg, state)
+
+
+def _cmd_traduci(arg, state, excludes):
+    if not arg:
+        tg_send(
+            "Usa: <code>/traduci nome film o serie</code>\n"
+            "Sincronizza .en.srt all'audio e chiede conferma per tradurre EN→IT."
+        )
+        return
+    pos = queue_position()
+    result = tg_send(
+        f"🔄 Preparo traduzione <b>{arg}</b>..."
+        + (f"\n⏳ Posizione {pos + 1}" if pos > 0 else "")
+    )
+    msg_id = result["result"]["message_id"] if result and result.get("ok") else None
+    download_queue.put({"type": "translate_prep", "query": arg, "msg_id": msg_id})
+
+
+def _cmd_ritraduci(arg, state, excludes):
+    if not arg:
+        tg_send(
+            "Usa: <code>/ritraduci nome film o serie</code>\n"
+            "Cancella il .it.srt esistente e ritraduce dal .en.srt (senza ri-scaricare nulla)."
+        )
+        return
+    pos = queue_position()
+    result = tg_send(
+        f"🔁 Preparo ritraduzione <b>{arg}</b>..."
+        + (f"\n⏳ Posizione {pos + 1}" if pos > 0 else "")
+    )
+    msg_id = result["result"]["message_id"] if result and result.get("ok") else None
+    download_queue.put({"type": "retranslate", "query": arg, "msg_id": msg_id})
+
+
+def _cmd_pulisci(arg, state, excludes):
+    pos = queue_position()
+    result = tg_send(
+        f"🧹 Cleanup in coda..."
+        + (f"\n⏳ Posizione {pos + 1}" if pos > 0 else "")
+    )
+    msg_id = result["result"]["message_id"] if result and result.get("ok") else None
+    download_queue.put({"type": "cleanup", "msg_id": msg_id})
+
+
+def _cmd_scarica(arg, state, excludes):
+    if not arg:
+        tg_send(
+            "Usa: <code>/scarica nome film [anno]</code>\n"
+            "Es: <code>/scarica Punch-Drunk Love 2002</code>\n"
+            "Cerca su TMDb, lo aggiunge a Radarr e ti fa scegliere il rilascio."
+        )
+        return
+    if not RADARR_URL or not RADARR_API_KEY:
+        tg_send("❌ Radarr non configurato — imposta RADARR_URL e RADARR_API_KEY.")
+        return
+    pos = queue_position()
+    result = tg_send(
+        f"🔎 Cerco <b>{arg}</b> su TMDb…"
+        + (f"\n⏳ Posizione {pos + 1}" if pos > 0 else "")
+    )
+    msg_id = result["result"]["message_id"] if result and result.get("ok") else None
+    download_queue.put({"type": "scarica", "query": arg, "msg_id": msg_id})
+
+
+def _cmd_cerca(arg, state, excludes):
+    if not arg:
+        tg_send(
+            "Usa: <code>/cerca nome film o serie</code>\n"
+            "Oppure scrivi semplicemente il nome senza slash."
+        )
+        return
+    search_and_offer(arg, state)
+
+
+def _cmd_coda(arg, state, excludes):
+    """Snapshot of the current download queue."""
+    try:
+        snapshot = list(download_queue.queue)
+    except Exception:
+        snapshot = []
+    if not snapshot:
+        tg_send("📋 <b>Coda</b>\nNessun job in coda.")
+        return
+
+    lines = ["📋 <b>Coda</b>"]
+    for i, job in enumerate(snapshot, 1):
+        jt = job.get("type", "?")
+        # Escape user-supplied strings (queries, filenames) before HTML-interpolating.
+        if jt == "single":
+            desc = f"⬇️ download <i>{html.escape(os.path.basename(job.get('path', '?')))}</i>"
+        elif jt == "batch":
+            desc = f"⬇️ batch ({len(job.get('paths', []))} file)"
+        elif jt == "translate":
+            desc = f"🤖 traduzione batch ({len(job.get('paths', []))} file)"
+        elif jt == "translate_prep":
+            desc = f"🔄 prep traduzione <i>{html.escape(str(job.get('query', '?')))}</i>"
+        elif jt == "retranslate":
+            desc = f"🔁 ritraduzione <i>{html.escape(str(job.get('query', '?')))}</i>"
+        elif jt == "sync":
+            desc = f"🔄 sync <i>{html.escape(str(job.get('query', '?')))}</i>"
+        elif jt == "cleanup":
+            desc = f"🧹 cleanup placeholder"
+        else:
+            desc = html.escape(jt)
+        lines.append(f"{i}. {desc}")
+    tg_send("\n".join(lines))
+
+
+def _cmd_log(arg, state, excludes):
+    """Send the last N log lines (default 30, max 200)."""
+    try:
+        n = int(arg) if arg else 30
+    except ValueError:
+        tg_send("Usa: <code>/log [n]</code> dove n è il numero di righe (max 200).")
+        return
+    n = max(1, min(n, 200))
+
+    try:
+        with open(LOG_FILE, "rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            read_size = min(size, 60_000)
+            f.seek(size - read_size)
+            tail = f.read().decode("utf-8", errors="ignore")
+    except Exception as e:
+        tg_send(f"❌ Impossibile leggere {LOG_FILE}: {e}")
+        return
+
+    lines = tail.splitlines()[-n:]
+    body = "\n".join(lines)
+    if len(body) > 3500:
+        body = body[-3500:]
+        body = body[body.find("\n") + 1:]
+    # Log lines can contain '<'/'>' from URLs, file paths, etc. — escape so
+    # Telegram's HTML parser doesn't reject the message.
+    tg_send(f"📜 <b>Ultime {len(lines)} righe di log</b>\n<pre>{html.escape(body)}</pre>")
+
+
+def _cmd_falliti(arg, state, excludes):
+    """List videos in 'failed' state and offer to retry them all."""
+    fresh = load_state()
+    failed = [(p, info) for p, info in fresh["asked"].items() if info.get("status") == "failed"]
+    if not failed:
+        tg_send("✅ Nessun video in stato fallito.")
+        return
+
+    failed.sort(key=lambda x: x[1].get("time", ""), reverse=True)
+    shown = failed[:15]
+    lines = [f"❌ <b>{len(failed)} video falliti</b>"]
+    for p, _ in shown:
+        lines.append(f"  • <i>{friendly_name(p)}</i>")
+    if len(failed) > 15:
+        lines.append(f"  …e altri {len(failed) - 15}")
+
+    retry_hash = str(abs(hash(("retry", tuple(p for p, _ in failed)))))[:8]
+    batches = load_batches()
+    batches[retry_hash] = {"paths": [p for p, _ in failed], "type": "retry_failed"}
+    save_batches(batches)
+
+    keyboard = {"inline_keyboard": [[
+        {"text": f"🔄 Riprova tutti ({len(failed)})", "callback_data": f"retry_failed:{retry_hash}"},
+        {"text": "❌ Annulla", "callback_data": f"retry_cancel:{retry_hash}"},
+    ]]}
+    tg_send("\n".join(lines), reply_markup=keyboard)
+
+
+# Registry — single source of truth for /aiuto and the dispatcher.
+# `canonical` is the form shown in /aiuto. `aliases` are interchangeable.
+# `group` controls the section in /aiuto.
+COMMANDS = [
+    # Search & download
+    {"canonical": "/cerca", "aliases": ["/search", "/sub"], "handler": _cmd_cerca,
+     "group": "Cerca & scarica", "args": "<nome>",
+     "desc": "Cerca nella libreria (o scrivi direttamente il nome senza slash)"},
+    {"canonical": "/scarica", "aliases": ["/download", "/req"], "handler": _cmd_scarica,
+     "group": "Cerca & scarica", "args": "<nome [anno]>",
+     "desc": "Richiedi un nuovo film via Radarr: scegli il rilascio (qualità, lingua, indexer)"},
+
+    # Sub management
+    {"canonical": "/sincronizza", "aliases": ["/sync"], "handler": _cmd_sincronizza,
+     "group": "Gestione sub", "args": "<nome|all>",
+     "desc": "Riallinea sub esistenti all'audio"},
+    {"canonical": "/traduci", "aliases": ["/translate", "/tr", "/t"], "handler": _cmd_traduci,
+     "group": "Gestione sub", "args": "<nome>",
+     "desc": "Traduce .en.srt → .it.srt (DeepL + Claude polish)"},
+    {"canonical": "/ritraduci", "aliases": ["/retranslate", "/rt"], "handler": _cmd_ritraduci,
+     "group": "Gestione sub", "args": "<nome>",
+     "desc": "Cancella .it.srt e ritraduce dal .en.srt esistente"},
+    {"canonical": "/cancella", "aliases": ["/delete", "/del"], "handler": _cmd_cancella,
+     "group": "Gestione sub", "args": "<nome>",
+     "desc": "Cancella tutti i sub e riaccoda per nuova ricerca"},
+
+    # Status & maintenance
+    {"canonical": "/stato", "aliases": ["/status", "/st"], "handler": _cmd_stato,
+     "group": "Stato & manutenzione", "args": "",
+     "desc": "Riepilogo dello stato attuale"},
+    {"canonical": "/coda", "aliases": ["/queue", "/q"], "handler": _cmd_coda,
+     "group": "Stato & manutenzione", "args": "",
+     "desc": "Mostra i job attualmente in coda"},
+    {"canonical": "/costi", "aliases": ["/costs", "/cost"], "handler": _cmd_costi,
+     "group": "Stato & manutenzione", "args": "",
+     "desc": "Costi DeepL + Claude polish + Claude fallback"},
+    {"canonical": "/falliti", "aliases": ["/failed"], "handler": _cmd_falliti,
+     "group": "Stato & manutenzione", "args": "",
+     "desc": "Lista video falliti, con pulsante per riprovare tutti"},
+    {"canonical": "/esclusi", "aliases": ["/excludes"], "handler": _cmd_esclusi,
+     "group": "Stato & manutenzione", "args": "",
+     "desc": "Lista cartelle escluse dalla scansione"},
+    {"canonical": "/log", "aliases": ["/logs"], "handler": _cmd_log,
+     "group": "Stato & manutenzione", "args": "[n]",
+     "desc": "Ultime n righe di log (default 30, max 200)"},
+    {"canonical": "/scansiona", "aliases": ["/scan"], "handler": _cmd_scansiona,
+     "group": "Stato & manutenzione", "args": "",
+     "desc": "Forza una scansione manuale"},
+    {"canonical": "/pulisci", "aliases": ["/cleanup"], "handler": _cmd_pulisci,
+     "group": "Stato & manutenzione", "args": "",
+     "desc": "Trova e rimuove sub placeholder/VIP"},
+    {"canonical": "/reset", "aliases": ["/azzera"], "handler": _cmd_reset,
+     "group": "Stato & manutenzione", "args": "",
+     "desc": "Azzera la cache (riparte da zero)"},
+
+    # Help (defined last so it can introspect the others)
+    {"canonical": "/aiuto", "aliases": ["/help", "/?"], "handler": None,
+     "group": "Stato & manutenzione", "args": "",
+     "desc": "Mostra questo messaggio"},
+]
+
+
+def _all_aliases():
+    """Flat list of every accepted command form (canonical + aliases)."""
+    out = []
+    for c in COMMANDS:
+        out.append(c["canonical"])
+        out.extend(c["aliases"])
+    return out
+
+
+def _find_command(token):
+    """Match a slash-token (e.g. '/t') to a command spec; None if not found."""
+    token = token.lower()
+    for c in COMMANDS:
+        if token == c["canonical"] or token in c["aliases"]:
+            return c
+    return None
+
+
+def _suggest_command(token):
+    """Return the closest known command alias to `token` if within edit distance 2."""
+    best = None
+    best_dist = 99
+    for alias in _all_aliases():
+        d = _levenshtein(token, alias)
+        if d < best_dist:
+            best_dist = d
+            best = alias
+    if best_dist <= 2:
+        return best
+    return None
+
+
+def _cmd_aiuto(arg, state, excludes):
+    groups = {}
+    for c in COMMANDS:
+        groups.setdefault(c["group"], []).append(c)
+
+    section_order = ["Cerca & scarica", "Gestione sub", "Stato & manutenzione"]
+    emoji = {"Cerca & scarica": "🔍", "Gestione sub": "🔄", "Stato & manutenzione": "ℹ️"}
+
+    lines = ["🤖 <b>Sub ITA Fetcher — comandi</b>"]
+    for section in section_order:
+        cmds = groups.get(section, [])
+        if not cmds:
+            continue
+        lines.append(f"\n{emoji.get(section, '•')} <b>{section}</b>")
+        for c in cmds:
+            # HTML-escape the args placeholder: it contains literal `<nome>` etc.
+            # which Telegram's HTML parser would otherwise reject as an invalid tag.
+            arg_part = f" <code>{html.escape(c['args'])}</code>" if c["args"] else ""
+            aliases_part = ""
+            if c["aliases"]:
+                aliases_part = f"  <i>(alias: {', '.join(c['aliases'])})</i>"
+            lines.append(f"  <code>{c['canonical']}</code>{arg_part} — {c['desc']}{aliases_part}")
+
+    lines.append(
+        "\n💡 <b>Suggerimento:</b> scrivi direttamente il nome di un film/serie "
+        "(senza slash) per cercarlo nella libreria."
+    )
+    tg_send("\n".join(lines))
+
+
+# Wire /aiuto handler now that _cmd_aiuto is defined.
+for _c in COMMANDS:
+    if _c["canonical"] == "/aiuto":
+        _c["handler"] = _cmd_aiuto
+        break
+
+
+def dispatch_command(text, state, excludes):
+    """Try to dispatch `text` as a slash command. Returns True if handled
+    (including unknown-slash with a 'did you mean?' reply); False to let the
+    caller fall through to free-text search."""
+    stripped = text.strip()
+    if not stripped.startswith("/"):
+        return False
+
+    parts = stripped.split(None, 1)
+    token = parts[0].lower()
+    arg = parts[1].strip() if len(parts) > 1 else ""
+
+    spec = _find_command(token)
+    if spec:
+        spec["handler"](arg, state, excludes)
+        return True
+
+    suggestion = _suggest_command(token)
+    if suggestion:
+        tg_send(
+            f"❓ Comando sconosciuto <code>{token}</code>. "
+            f"Forse intendevi <code>{suggestion}</code>?\n"
+            f"Scrivi <code>/aiuto</code> per la lista completa."
+        )
+    else:
+        tg_send(
+            f"❓ Comando sconosciuto <code>{token}</code>.\n"
+            f"Scrivi <code>/aiuto</code> per la lista completa."
+        )
+    return True
+
+
 def process_callbacks(state, excludes):
     """Check for Telegram callback responses."""
     offset = state.get("last_offset", 0)
@@ -1946,6 +3434,142 @@ def process_callbacks(state, excludes):
 
             action, path_hash = data.split(":", 1)
             video_path = find_path_by_hash(state, path_hash)
+
+            # /scarica callbacks: film pick, release pick, pagination, grab, cancel.
+            # Hash carried in `data` is the film_hash, not a video path hash, so we
+            # short-circuit the path-hash lookup that runs further down.
+            if action in ("radarr_pick", "radarr_rel", "radarr_page", "radarr_grab", "radarr_cancel"):
+                # data format is action:film_hash[:extra]
+                _, _, rest = data.partition(":")
+                pieces = rest.split(":")
+                film_hash = pieces[0] if pieces else ""
+
+                if action == "radarr_cancel":
+                    tg_answer_callback(cb_id, "❌ Annullato")
+                    if msg_id:
+                        tg_edit_message(msg_id, "❌ Richiesta annullata.")
+                    rs = load_requests()
+                    pending = rs.setdefault("pending_radarr", {})
+                    pending.pop(f"candidates:{film_hash}", None)
+                    pending.pop(f"film:{film_hash}", None)
+                    save_requests(rs)
+                    continue
+
+                if action == "radarr_pick" and len(pieces) >= 2:
+                    try:
+                        tmdb_id = int(pieces[1])
+                    except ValueError:
+                        tg_answer_callback(cb_id, "⚠️ Errore")
+                        continue
+                    tg_answer_callback(cb_id, "🔎 Cerco rilasci...")
+                    do_scarica_releases(film_hash, tmdb_id, progress_msg_id=msg_id)
+                    continue
+
+                if action == "radarr_page" and len(pieces) >= 2:
+                    try:
+                        page = int(pieces[1])
+                    except ValueError:
+                        tg_answer_callback(cb_id, "⚠️ Errore")
+                        continue
+                    tg_answer_callback(cb_id, "")
+                    _render_release_page(film_hash, page, progress_msg_id=msg_id)
+                    continue
+
+                if action == "radarr_rel" and len(pieces) >= 2:
+                    try:
+                        release_idx = int(pieces[1])
+                    except ValueError:
+                        tg_answer_callback(cb_id, "⚠️ Errore")
+                        continue
+                    if not _render_release_confirm(film_hash, release_idx, progress_msg_id=msg_id):
+                        tg_answer_callback(cb_id, "⚠️ Sessione scaduta")
+                    else:
+                        tg_answer_callback(cb_id, "")
+                    continue
+
+                if action == "radarr_grab" and len(pieces) >= 2:
+                    try:
+                        release_idx = int(pieces[1])
+                    except ValueError:
+                        tg_answer_callback(cb_id, "⚠️ Errore")
+                        continue
+                    rs = load_requests()
+                    pending = rs.setdefault("pending_radarr", {})
+                    entry = pending.get(f"film:{film_hash}")
+                    if not entry or not (0 <= release_idx < len(entry["releases"])):
+                        tg_answer_callback(cb_id, "⚠️ Sessione scaduta")
+                        if msg_id:
+                            tg_edit_message(msg_id, "⚠️ Sessione scaduta. Lancia di nuovo /scarica.")
+                        continue
+                    chosen = entry["releases"][release_idx]
+                    try:
+                        RadarrClient().grab(chosen["guid"], chosen["indexerId"])
+                    except Exception as e:
+                        tg_answer_callback(cb_id, "❌ Errore")
+                        if msg_id:
+                            tg_edit_message(msg_id, f"❌ Errore grab: {e}")
+                        continue
+                    tg_answer_callback(cb_id, "📥 Avviato")
+
+                    title_label = entry["title"] + (f" ({entry['year']})" if entry.get("year") else "")
+                    langs = detect_release_languages(chosen)
+                    pending[f"download:{entry['tmdb_id']}"] = {
+                        "title": entry["title"],
+                        "year": entry.get("year"),
+                        "tmdb_id": entry["tmdb_id"],
+                        "movie_id": entry["movie_id"],
+                        "indexer": chosen.get("indexer"),
+                        "release_title": chosen.get("title"),
+                        "languages": langs,
+                        "requested_at": datetime.now().isoformat(),
+                        "telegram_msg_id": msg_id,
+                    }
+                    pending.pop(f"film:{film_hash}", None)
+                    save_requests(rs)
+                    if msg_id:
+                        tg_edit_message(
+                            msg_id,
+                            f"📥 <b>{title_label}</b> in download via <i>{chosen.get('indexer')}</i>.\n"
+                            f"Ti avviso quando arriva il file + sub ITA."
+                        )
+                    continue
+
+                continue
+
+            # Retry-failed callbacks from /falliti
+            if action in ("retry_failed", "retry_cancel"):
+                state = load_state()
+                batches = load_batches()
+                batch = batches.get(path_hash)
+                if not batch:
+                    tg_answer_callback(cb_id, "⚠️ Operazione non trovata")
+                    continue
+
+                if action == "retry_cancel":
+                    tg_answer_callback(cb_id, "❌ Annullato")
+                    if msg_id:
+                        tg_edit_message(msg_id, "❌ Riprova annullata.")
+                    batches.pop(path_hash, None)
+                    save_batches(batches)
+                    continue
+
+                paths = batch.get("paths", [])
+                tg_answer_callback(cb_id, f"🔄 Riaccodati {len(paths)} video")
+                if msg_id:
+                    tg_edit_message(msg_id, f"🔄 Riaccodati <b>{len(paths)}</b> video falliti.")
+                for p in paths:
+                    state["asked"].pop(p, None)
+                    pos = queue_position()
+                    queue_msg = tg_send(
+                        f"🔍 In coda: <b>{friendly_name(p)}</b>"
+                        + (f"\n⏳ Posizione {pos + 1}" if pos > 0 else "")
+                    )
+                    queue_msg_id = queue_msg["result"]["message_id"] if queue_msg and queue_msg.get("ok") else None
+                    download_queue.put({"type": "single", "path": p, "msg_id": queue_msg_id})
+                save_state(state)
+                batches.pop(path_hash, None)
+                save_batches(batches)
+                continue
 
             # Handle batch callbacks
             if action in ("delete_yes", "delete_no"):
@@ -2025,7 +3649,7 @@ def process_callbacks(state, excludes):
                     for p in batch.get("paths", []):
                         state["asked"][p] = {"time": datetime.now().isoformat(), "status": "en_only"}
                     if msg_id:
-                        tg_edit_message(msg_id, f"🇬🇧 Sub inglesi mantenuti senza traduzione.\nPuoi tradurre in seguito con /translate")
+                        tg_edit_message(msg_id, f"🇬🇧 Sub inglesi mantenuti senza traduzione.\nPuoi tradurre in seguito con /traduci")
                     batches.pop(path_hash, None)
                     save_batches(batches)
                     save_state(state)
@@ -2117,125 +3741,14 @@ def process_callbacks(state, excludes):
             if chat_id != str(TELEGRAM_CHAT_ID):
                 continue
 
-            if text == "/status":
-                fresh = load_state()
-                pending = sum(1 for v in fresh["asked"].values() if v["status"] == "pending")
-                downloaded = len(fresh["downloaded"])
-                failed = sum(1 for v in fresh["asked"].values() if v["status"] == "failed")
-                excluded = len(excludes)
-                tg_send(
-                    f"📊 <b>Status</b>\n\n"
-                    f"⏳ In attesa di risposta: {pending}\n"
-                    f"✅ Scaricati: {downloaded}\n"
-                    f"❌ Non trovati: {failed}\n"
-                    f"🚫 Cartelle escluse: {excluded}\n"
-                    f"   ({', '.join(sorted(excludes)) if excludes else 'nessuna'})"
-                )
-
-            elif text == "/scan":
-                tg_send("🔍 Avvio scansione manuale...")
-                missing = scan_missing(state, excludes)
-                tg_send(f"🔍 Trovati {len(missing)} video senza sub ITA")
-
-            elif text == "/costs":
-                costs = load_state().get("claude_costs", {})
-                total_cost = costs.get("total_cost_usd", 0.0)
-                translations = costs.get("translations", 0)
-                input_t = costs.get("total_input_tokens", 0)
-                output_t = costs.get("total_output_tokens", 0)
-                tg_send(
-                    f"💰 <b>Costi Claude API</b>\n\n"
-                    f"🔄 Traduzioni effettuate: {translations}\n"
-                    f"📊 Token usati: {input_t:,} in + {output_t:,} out\n"
-                    f"💵 Costo totale: <b>${total_cost:.4f}</b>\n"
-                    f"📈 Media per traduzione: ${total_cost / max(translations, 1):.4f}"
-                )
-
-            elif text == "/help":
-                tg_send(
-                    f"🤖 <b>Sub ITA Fetcher</b>\n\n"
-                    f"Comandi:\n"
-                    f"/status — Stato attuale\n"
-                    f"/scan — Forza scansione\n"
-                    f"/costs — Costi traduzioni Claude\n"
-                    f"/sync — Riallinea tutti i sub ITA ai video\n"
-                    f"/translate &lt;nome&gt; — Sync .en.srt e chiedi se tradurre\n"
-                    f"/delete &lt;nome&gt; — Cancella sub e rimetti in coda\n"
-                    f"/cleanup — Trova e rimuovi sub placeholder/VIP\n"
-                    f"/excludes — Lista cartelle escluse\n"
-                    f"/reset — Resetta cache (riparte da zero)\n"
-                    f"/help — Questo messaggio\n\n"
-                    f"<b>Ricerca manuale:</b>\n"
-                    f"Scrivi il nome di un film o serie (es. 'Birdman' o 'The Chosen') "
-                    f"e cercherò nella libreria i file senza sub ITA."
-                )
-
-            elif text == "/excludes":
-                if excludes:
-                    lines = "\n".join(f"  • {e}" for e in sorted(excludes))
-                    tg_send(f"🚫 <b>Cartelle escluse:</b>\n{lines}")
-                else:
-                    tg_send("🚫 Nessuna cartella esclusa")
-
-            elif text == "/reset":
-                state["asked"] = {}
-                state["downloaded"] = {}
-                save_state(state)
-                tg_send("🔄 Cache resettata. La prossima scansione ripartirà da zero.")
-
-            elif text.startswith("/sync"):
-                query = text[5:].strip() if len(text) > 5 else ""
-                if not query:
-                    tg_send("Usa: <code>/sync nome serie o film</code>\nEs: <code>/sync Pluribus</code> o <code>/sync The Chosen</code>\nOppure <code>/sync all</code> per tutti.")
-                else:
-                    pos = queue_position()
-                    result = tg_send(
-                        f"🔄 Sync <b>{query}</b> in coda..."
-                        + (f"\n⏳ Posizione {pos + 1}" if pos > 0 else "")
-                    )
-                    msg_id = result["result"]["message_id"] if result and result.get("ok") else None
-                    download_queue.put({"type": "sync", "query": query, "msg_id": msg_id})
-
-            elif text.startswith("/delete"):
-                query = text[len("/delete"):].strip()
-                if not query:
-                    tg_send(
-                        "Usa: <code>/delete nome film o serie</code>\n"
-                        "Cancella i sub trovati e rimette in coda per nuova ricerca."
-                    )
-                else:
-                    offer_delete(query, state)
-
-            elif text.startswith("/translate"):
-                query = text[len("/translate"):].strip()
-                if not query:
-                    tg_send(
-                        "Usa: <code>/translate nome film o serie</code>\n"
-                        "Sincronizza i .en.srt trovati all'audio e poi chiede se tradurre in italiano."
-                    )
-                else:
-                    pos = queue_position()
-                    result = tg_send(
-                        f"🔄 Translate prep <b>{query}</b> in coda..."
-                        + (f"\n⏳ Posizione {pos + 1}" if pos > 0 else "")
-                    )
-                    msg_id = result["result"]["message_id"] if result and result.get("ok") else None
-                    download_queue.put({"type": "translate_prep", "query": query, "msg_id": msg_id})
-
-            elif text == "/cleanup":
-                pos = queue_position()
-                result = tg_send(
-                    f"🧹 Cleanup in coda..."
-                    + (f"\n⏳ Posizione {pos + 1}" if pos > 0 else "")
-                )
-                msg_id = result["result"]["message_id"] if result and result.get("ok") else None
-                download_queue.put({"type": "cleanup", "msg_id": msg_id})
-
-            elif text.startswith("/sub ") or (not text.startswith("/") and len(text) >= 3):
-                # Manual search: user typed a movie/series name
-                query = text[5:].strip() if text.startswith("/sub ") else text.strip()
-                if query:
-                    search_and_offer(query, state)
+            if text.startswith("/"):
+                # All slash commands go through the registry dispatcher.
+                # Unknown slash commands trigger a "did you mean?" reply, so we
+                # never silently fall through to free-text search on a typo.
+                dispatch_command(text, state, excludes)
+            elif len(text) >= 3:
+                # Free-text (no slash) is always interpreted as a library search.
+                search_and_offer(text.strip(), state)
 
     save_state(state)
 
@@ -2836,6 +4349,16 @@ def _queue_worker(state_ref):
                 msg_id = job.get("msg_id")
                 log.info(f"  Queue: translate_prep '{query}'")
                 do_translate_prep(query, state, progress_msg_id=msg_id)
+            elif job_type == "retranslate":
+                query = job["query"]
+                msg_id = job.get("msg_id")
+                log.info(f"  Queue: retranslate '{query}'")
+                do_retranslate(query, state, progress_msg_id=msg_id)
+            elif job_type == "scarica":
+                query = job["query"]
+                msg_id = job.get("msg_id")
+                log.info(f"  Queue: scarica '{query}'")
+                do_scarica_search(query, progress_msg_id=msg_id)
             elif job_type == "cleanup":
                 msg_id = job.get("msg_id")
                 log.info("  Queue: cleanup placeholders")
