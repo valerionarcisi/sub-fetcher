@@ -1927,11 +1927,13 @@ def polish_translation_with_claude(en_blocks, it_blocks, video_name):
             f"Per ogni riga sotto trovi la frase inglese e una traduzione italiana automatica.\n"
             f"Se la traduzione italiana suona innaturale, troppo letterale, o sbagliata per un sottotitolo "
             f"cinematografico (in cui si usa italiano parlato/colloquiale, come in un doppiaggio), riscrivila. "
+            f"Mantieni coerenza di genere grammaticale tra i cue consecutivi dello stesso personaggio. "
             f"Altrimenti SALTA quella riga.\n\n"
             f"Output: SOLO le righe da riscrivere, una per riga, nel formato esatto:\n"
-            f"[N] testo riscritto\n\n"
-            f"Niente intestazioni, niente commenti, niente spiegazioni. Se nessuna riga va riscritta, "
-            f"restituisci stringa vuota.\n\n"
+            f"[N] testo italiano riscritto\n\n"
+            f"IMPORTANTE: [N] è il numero di riga. Dopo [N] scrivi SOLO il testo italiano finale, "
+            f"senza 'EN:', senza 'IT:', senza '|', senza spiegazioni.\n"
+            f"Niente intestazioni, niente commenti. Se nessuna riga va riscritta, restituisci stringa vuota.\n\n"
             + "\n".join(lines)
         )
 
@@ -1968,7 +1970,15 @@ def polish_translation_with_claude(en_blocks, it_blocks, video_name):
                 line = line.strip()
                 m = re.match(r"\[(\d+)\]\s*(.+)", line)
                 if m:
-                    parsed_in_batch[int(m.group(1))] = m.group(2)
+                    raw = m.group(2)
+                    # Guard: strip double-translation artifact if Claude echoed "EN: ... | IT: ..."
+                    if "| IT:" in raw:
+                        raw = raw.split("| IT:", 1)[1].strip()
+                    elif raw.upper().startswith("IT:"):
+                        raw = raw[3:].strip()
+                    elif raw.upper().startswith("EN:"):
+                        continue  # Claude echoed the English — skip
+                    parsed_in_batch[int(m.group(1))] = raw
 
             # If the model was cut off, drop the last rewrite — it may be truncated.
             if result.get("stop_reason") == "max_tokens" and parsed_in_batch:

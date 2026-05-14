@@ -2084,5 +2084,49 @@ class TestCommandDispatcher(unittest.TestCase):
                 seen[form] = c["canonical"]
 
 
+class TestPolishOutputParsing(unittest.TestCase):
+    """Verify the post-processing step strips double-translation artifacts."""
+
+    def _parse_polish_line(self, line):
+        """Replicate the parsing logic from polish_translation_with_claude."""
+        import re
+        m = re.match(r"\[(\d+)\]\s*(.+)", line.strip())
+        if not m:
+            return None, None
+        raw = m.group(2)
+        if "| IT:" in raw:
+            raw = raw.split("| IT:", 1)[1].strip()
+        elif raw.upper().startswith("IT:"):
+            raw = raw[3:].strip()
+        elif raw.upper().startswith("EN:"):
+            return int(m.group(1)), None  # skip
+        return int(m.group(1)), raw
+
+    def test_clean_output_unchanged(self):
+        idx, text = self._parse_polish_line("[5] Ciao, come stai?")
+        self.assertEqual(idx, 5)
+        self.assertEqual(text, "Ciao, come stai?")
+
+    def test_double_translation_stripped(self):
+        idx, text = self._parse_polish_line("[3] EN: How are you? | IT: Come stai?")
+        self.assertEqual(idx, 3)
+        self.assertEqual(text, "Come stai?")
+
+    def test_it_prefix_stripped(self):
+        idx, text = self._parse_polish_line("[7] IT: Tutto bene.")
+        self.assertEqual(idx, 7)
+        self.assertEqual(text, "Tutto bene.")
+
+    def test_en_only_skipped(self):
+        idx, text = self._parse_polish_line("[2] EN: How are you?")
+        self.assertEqual(idx, 2)
+        self.assertIsNone(text)
+
+    def test_it_prefix_case_insensitive(self):
+        idx, text = self._parse_polish_line("[1] it: Va bene così.")
+        self.assertEqual(idx, 1)
+        self.assertEqual(text, "Va bene così.")
+
+
 if __name__ == "__main__":
     unittest.main()
