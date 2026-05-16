@@ -1851,7 +1851,8 @@ def translate_srt_with_deepl(srt_content):
 
             for local_i, idx in enumerate(slice_idx):
                 idx_str, timecode, _ = out_blocks[idx]
-                out_blocks[idx] = (idx_str, timecode, translations[local_i]["text"])
+                # tag_handling=html makes DeepL escape ' and " as &#x27;/&quot;.
+                out_blocks[idx] = (idx_str, timecode, html.unescape(translations[local_i]["text"]))
 
         except urllib.error.HTTPError as e:
             body = ""
@@ -1978,7 +1979,7 @@ def polish_translation_with_claude(en_blocks, it_blocks, video_name):
                         raw = raw[3:].strip()
                     elif raw.upper().startswith("EN:"):
                         continue  # Claude echoed the English — skip
-                    parsed_in_batch[int(m.group(1))] = raw
+                    parsed_in_batch[int(m.group(1))] = html.unescape(raw)
 
             # If the model was cut off, drop the last rewrite — it may be truncated.
             if result.get("stop_reason") == "max_tokens" and parsed_in_batch:

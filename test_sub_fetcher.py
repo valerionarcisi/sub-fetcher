@@ -2128,5 +2128,63 @@ class TestPolishOutputParsing(unittest.TestCase):
         self.assertEqual(text, "Va bene così.")
 
 
+class TestHtmlEntitiesUnescapedInTranslation(unittest.TestCase):
+    """DeepL is called with tag_handling=html (to preserve <i>...</i>), which
+    makes it escape apostrophes/quotes as &#x27;/&quot;. Output must be
+    unescaped so the SRT renders correctly for humans."""
+
+    def test_deepl_output_is_html_unescaped(self):
+        from unittest.mock import patch, MagicMock
+        original_key = sub_fetcher.DEEPL_API_KEY
+        sub_fetcher.DEEPL_API_KEY = "fake-key"
+
+        srt = "1\n00:00:01,000 --> 00:00:02,000\nIt's fine.\n"
+
+        resp = MagicMock()
+        resp.read.return_value = json.dumps({
+            "translations": [
+                {"text": "L&#x27;&quot;ora&quot; va bene."},
+            ]
+        }).encode()
+        resp.__enter__ = lambda s: s
+        resp.__exit__ = lambda *a: None
+
+        try:
+            with patch("urllib.request.urlopen", return_value=resp):
+                result = sub_fetcher.translate_srt_with_deepl(srt)
+            self.assertIsNotNone(result)
+            blocks, _ = result
+            self.assertEqual(blocks[0][2], 'L\'"ora" va bene.')
+            self.assertNotIn("&#x27;", blocks[0][2])
+            self.assertNotIn("&quot;", blocks[0][2])
+        finally:
+            sub_fetcher.DEEPL_API_KEY = original_key
+
+    def test_polish_rewrite_is_html_unescaped(self):
+        from unittest.mock import patch, MagicMock
+        original_key = sub_fetcher.CLAUDE_API_KEY
+        sub_fetcher.CLAUDE_API_KEY = "fake-key"
+
+        en_blocks = [("1", "00:00:01,000 --> 00:00:02,000", "It's fine.")]
+        it_blocks = [("1", "00:00:01,000 --> 00:00:02,000", "Va bene.")]
+
+        resp = MagicMock()
+        resp.read.return_value = json.dumps({
+            "content": [{"type": "text", "text": "[0] L&#x27;ora &amp; il momento"}],
+            "usage": {"input_tokens": 1, "output_tokens": 1},
+            "stop_reason": "end_turn",
+        }).encode()
+        resp.__enter__ = lambda s: s
+        resp.__exit__ = lambda *a: None
+
+        try:
+            with patch("urllib.request.urlopen", return_value=resp):
+                polished, n = sub_fetcher.polish_translation_with_claude(en_blocks, it_blocks, "Test")
+            self.assertEqual(n, 1)
+            self.assertEqual(polished[0][2], "L'ora & il momento")
+        finally:
+            sub_fetcher.CLAUDE_API_KEY = original_key
+
+
 if __name__ == "__main__":
     unittest.main()
